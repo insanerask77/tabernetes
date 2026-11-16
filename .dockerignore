@@ -1,0 +1,10 @@
+# The static site image (site/Dockerfile) only needs dist/ and site/ in its
+# build context. Everything else only makes the context bigger (the Kubernetes
+# checkout in .build/, node_modules in web/, the git history).
+.git/
+.build/
+.github/
+k8s/
+node/
+vm/
+web/

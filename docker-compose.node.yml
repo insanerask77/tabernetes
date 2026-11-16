@@ -1,0 +1,44 @@
+# Docker Compose para el NODO de Tabernetes (kubelet + containerd + agente).
+#
+# Es la misma imagen que imprime `join` dentro del terminal del navegador, pero
+# arrancada con compose en vez de `docker run`. El nodo es efímero: vive lo que
+# dura la conexión WebRTC con el clúster del navegador.
+#
+# Uso:
+#   1. En el terminal de Tabernetes (navegador), ejecuta:  join
+#      Te imprime un `docker run ...` con un PUERTO y un TOKEN.
+#   2. Copia el puerto y el token y lanza el nodo aquí:
+#
+#        NODE_PORT=50001 TOKEN="<token>" \
+#          docker compose -f docker-compose.node.yml run --rm node
+#
+#   3. El nodo imprime una línea "accept ...". Pégala en el terminal del navegador.
+#
+# Para un nodo en otra máquina de la LAN, añade --advertise antes del token:
+#   command: ["--advertise", "${ADVERTISE_IP}", "${TOKEN}"]
+
+services:
+  node:
+    image: zot.madolell.com/tabernetes-node:1.9.0
+    pull_policy: always
+    stdin_open: true
+    tty: true
+    mem_limit: 2g
+    pids_limit: 4096
+    security_opt:
+      - seccomp=unconfined
+      - systempaths=unconfined
+      # apparmor=unconfined   # solo hosts Linux con AppArmor (macOS no lo usa)
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      # El puerto viene del `join` (50000 + nº de nodo). Se publica solo en
+      # localhost, igual que el comando que imprime el navegador.
+      - "127.0.0.1:${NODE_PORT:-50001}:${NODE_PORT:-50001}/udp"
+    command: ["${TOKEN}"]
+    volumes:
+      # Estado de containerd (imágenes descargadas), reutilizado entre joins.
+      - containerd-data:/var/lib/containerd
+
+volumes:
+  containerd-data:

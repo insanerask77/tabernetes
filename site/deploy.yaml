@@ -1,0 +1,54 @@
+# Minimal example to run the Tabernetes site on Kubernetes. Adapt the image,
+# the host and the ingress class to your cluster; TLS is required (the terminal,
+# the shared worker and the service worker need a secure context).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tabernetes
+  labels:
+    app: tabernetes
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tabernetes
+  template:
+    metadata:
+      labels:
+        app: tabernetes
+    spec:
+      containers:
+        - name: tabernetes
+          image: tabernetes-site:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tabernetes
+spec:
+  selector:
+    app: tabernetes
+  ports:
+    - port: 80
+      targetPort: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tabernetes
+spec:
+  ingressClassName: nginx # adapt to your controller
+  rules:
+    - host: k8s.1o1.zip
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: tabernetes
+                port:
+                  number: 80
