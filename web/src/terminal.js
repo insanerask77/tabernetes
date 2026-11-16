@@ -280,7 +280,7 @@ export async function startTerminal(el, opts) {
     if (search) return `(${search.failed ? "failed " : ""}reverse-i-search)\`${search.query}': `;
     if (pending) return "> ";
     const dir = cwd.replace(/^\/root(?=\/|$)/, "~");
-    return `\x1b[1;34mjkroepke.de\x1b[0m:\x1b[1;32m${dir}\x1b[0m$ `;
+    return `\x1b[1;34mrafamadolell.com\x1b[0m:\x1b[1;32m${dir}\x1b[0m$ `;
   };
   // redraw renders prompt and line, also when the line wraps over several rows.
   let row = 0; // row of the cursor, relative to the prompt
@@ -632,7 +632,7 @@ async function bootHere(term, opts, logs, crash) {
 // broadcast prints what systemd sends to every terminal with wall(1) on
 // poweroff and reboot.
 function broadcast(term, by, reboot) {
-  term.write(`\r\n\r\nBroadcast message from root@jkroepke.de${by ? ` on ${by}` : ""}:\r\n\r\n`);
+  term.write(`\r\n\r\nBroadcast message from root@rafamadolell.com${by ? ` on ${by}` : ""}:\r\n\r\n`);
   term.writeln(`The system will ${reboot ? "reboot" : "power off"} now!`);
   term.writeln("");
 }

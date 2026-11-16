@@ -103,9 +103,9 @@ jobs:
         run: |
           echo "kubernetes=$(sed -n 's/^KUBERNETES_VERSION = "\(.*\)"$/\1/p' mise.toml)" >> "${GITHUB_OUTPUT}"
           if [ "${REF_TYPE}" = "tag" ]; then
-            echo "tags=ghcr.io/jkroepke/tabernetes:${REF_NAME#v},ghcr.io/jkroepke/tabernetes:latest" >> "${GITHUB_OUTPUT}"
+            echo "tags=ghcr.io/rafamadolell/tabernetes:${REF_NAME#v},ghcr.io/rafamadolell/tabernetes:latest" >> "${GITHUB_OUTPUT}"
           else
-            echo "tags=ghcr.io/jkroepke/tabernetes:latest" >> "${GITHUB_OUTPUT}"
+            echo "tags=ghcr.io/rafamadolell/tabernetes:latest" >> "${GITHUB_OUTPUT}"
           fi
 
       - name: Set up QEMU
@@ -190,7 +190,7 @@ jobs:
   # main can take changes that should not be released yet.
   release:
     if: >-
-      github.repository_owner == 'jkroepke'
+      github.repository_owner == 'rafamadolell'
       && github.ref_name == 'main'
       && vars.RELEASES_ENABLED == 'true'
     name: Release
@@ -236,7 +236,7 @@ jobs:
   publish:
     name: Publish release
     if: >-
-      github.repository_owner == 'jkroepke'
+      github.repository_owner == 'rafamadolell'
       && github.ref_type == 'tag'
       && startsWith(github.ref_name, 'v')
     needs:

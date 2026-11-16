@@ -120,7 +120,7 @@ func TestOpts(t *testing.T) {
 
 func TestSplitWgetArgs(t *testing.T) {
 	for _, tc := range []struct{ args, flags, urls []string }{
-		{[]string{"https://jkroepke.de", "-v"}, []string{"-v"}, []string{"https://jkroepke.de"}},
+		{[]string{"https://rafamadolell.com", "-v"}, []string{"-v"}, []string{"https://rafamadolell.com"}},
 		{[]string{"-qO-", "localhost:8080"}, []string{"-qO-"}, []string{"localhost:8080"}},
 		{[]string{"localhost:8080", "-qO-"}, []string{"-qO-"}, []string{"localhost:8080"}},
 		{[]string{"u", "-O", "-"}, []string{"-O", "-"}, []string{"u"}},
@@ -143,7 +143,7 @@ func TestWgetURL(t *testing.T) {
 		"localhost/x":              "http://localhost/x",
 		"127.0.0.1:80":             "http://127.0.0.1:80",
 		"http://localhost:8080":    "http://localhost:8080",
-		"jkroepke.de":              "https://jkroepke.de",
+		"rafamadolell.com":         "https://rafamadolell.com",
 		"10.244.0.2":               "http://10.244.0.2",
 		"10.96.12.7:8080/x":        "http://10.96.12.7:8080/x",
 		"localhost.example.com:80": "https://localhost.example.com:80",

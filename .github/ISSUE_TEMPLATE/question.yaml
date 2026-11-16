@@ -33,4 +33,4 @@ body:
         - required: true
           #language=markdown
           label: |
-            I could not find a solution in the [README](https://github.com/jkroepke/tabernetes#readme) or the existing issues.
+            I could not find a solution in the [README](https://github.com/rafamadolell/tabernetes#readme) or the existing issues.

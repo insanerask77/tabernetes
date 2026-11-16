@@ -17,7 +17,7 @@ node = "26.13.1"
 [env]
 # renovate: github-tags=kubernetes/kubernetes
 KUBERNETES_VERSION = "v1.37.2"
-NODE_IMAGE = "ghcr.io/jkroepke/tabernetes"
+NODE_IMAGE = "ghcr.io/rafamadolell/tabernetes"
 # The shell of the terminal, vendored into the Kubernetes checkout by k8s/patch.go.
 # renovate: go=mvdan.cc/sh/v3
 MVDAN_SH_VERSION = "v3.14.1"
