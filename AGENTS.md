@@ -282,6 +282,33 @@ that name.
   the connection, and use a context that does not come from the request
   (`dockerapi/stream.go`).
 
+- **Restart policies across a reload** (`dockerapi/restart.go`): a reload
+  that keeps the shared worker only kills the VMs of the tab; it is not a
+  restart of dockerd. Such containers follow the normal policy
+  (`RetryRestarts` when a tab opens again). Only a fresh worker runs
+  `RestartContainers`, which uses dockerd's rules for a daemon start. Do not
+  merge the two: `always` after `docker stop` must stay stopped on a plain
+  reload.
+- **docker attach -it keeps stdin open after a detach**: dockerd closes the
+  stdin of a container at the end of an attach only without a tty; kubectl
+  attach closes it either way. The Docker API sends `"detachable": true` to
+  init, and init then keeps stdin open when the main process has a pty.
+- **The 9p tree and the guest disagree**: the root is mounted with
+  `cache=loose`, so reads and writes of a running VM's tree from the page
+  (docker cp) need init's `{"sync": true}` request first.
+- **Volumes are v86 sub file systems** (`web/src/volumes.js`): v86 has one
+  9p device, so every Docker mount is an `FS` object mounted into the root
+  with `FS.Mount` (the mount point must not exist in the tree: `Tree.take`
+  removes it first). Volume data files in OPFS are immutable and named by a
+  random id; a sync writes new files, then the index, under the lock
+  `tabernetes-volume:<name>`, and deletes replaced files only when no other
+  VM holds the shared lock `tabernetes-volume-use:<name>`. v86 writes into
+  the buffer it got from the storage, so reads of volume and bind files must
+  return a copy. A read-only mount is a bind remount by init, not a JS check.
+- **Browser tests**: `tabernetesTerminal.exec` does not mark the terminal
+  busy, so Ctrl-C only reaches commands typed with `keys:`, and a second
+  exec waits for the first: start a long command with the shell's `&`.
+
 ## Hosting and network constraints
 
 - **No registry sends CORS headers** (Docker Hub incl. auth and CDN, ghcr.io,

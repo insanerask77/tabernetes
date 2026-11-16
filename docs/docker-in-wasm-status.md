@@ -273,25 +273,148 @@ all with the rest of the database.
 - `restart` stops with B's stop (the image's signal, `?t=`) and starts with
   C's new VM.
 
+## The everyday gaps, closed in parallel (2026-11-16)
+
+Four agents worked at the same time, each in its own clone, and the results
+were merged in the order CMDS, FLAGS, OPS, VOLS. Each tested its part in the
+browser; the merged result passed one integrated browser test (volumes,
+bind mounts, `docker cp`, run flags, restart policies, pause, top, stats,
+rename, wait, filters, logs, events, tag, a reload) and a regression test
+(a pod with port-forward, an `emptyDir` pod, `stop -t 2` = 137 in 2.02 s,
+`stop` = 143, `run -it` with Ctrl-P Ctrl-Q, `attach`, `exit 7`, `start -ai`).
+
+### docker run options
+
+`-w`, `-u`, `-h`, `--entrypoint` (`""` resets it), `-l`, `--label-file`,
+`--env-file` (Docker's format: comments, a bare `KEY` takes the value of the
+shell), `-m`, `-P`, `--restart`, `--init`, `-a`, `--stop-signal`,
+`--stop-timeout`, `--detach-keys`, `--sig-proxy`, `--log-driver`,
+`--log-opt`, `-v` and `--mount` work on `docker run` (and on `docker create`
+without the attach options), with the parser and the messages of the docker
+CLI (`dockerrunflags.go`). The user and the entrypoint go to the VM as the
+annotations `dev.tabernetes.v86.user` and `dev.tabernetes.v86.entrypoint`.
+As in dockerd, an entrypoint drops the CMD of the image too. A missing
+working directory is created like runc does. `-m` is the RAM of the VM: from
+128 MiB (what a VM needs to boot) to 2 GiB (the limit of v86). `-P`
+publishes every exposed TCP port of the image on a free host port. `--init`
+does nothing: init of the VM already acts like tini.
+
+### Restart policies
+
+`no`, `on-failure[:N]`, `always` and `unless-stopped` follow dockerd's
+restart manager: 100 ms before the first restart, doubled up to a minute,
+back to 100 ms after a run of 10 s. While a container waits it shows
+"Restarting (N) X ago". `docker stop` ends the restarts until the next
+start by the user. The policy, the count and "stopped by the user" are
+labels; the backoff lives in memory. If a tab reloads, its VMs die (137) and
+the policy restarts them in another tab, or in the next tab that opens. If
+the control plane starts fresh, a marker file in `/var/lib/containerd` makes
+the first tab start containerd at once, and containers start again as after
+a restart of dockerd.
+
+### More commands
+
+`docker wait`, `rename`, `top`, `pause`, `unpause`, `tag`, `container
+prune`, `image prune`, `system df`, `system prune`, `cp`, `stats`, `events`
+and `volume` work like Docker, with its texts, prompts and outputs.
+`docker pause` stops the emulator of the container's VM: every process in
+it stands still, like under the cgroup freezer. `docker top` asks init for
+the processes (`{"ps": true}`), because many images have no `ps`.
+`docker tag` adds a second reference to the same manifest in the image
+store of the browser. Container sizes are 0B: what a container writes lives
+in its VM.
+
+`docker ps --filter` works in the Docker API with dockerd's rules, and
+`--format` takes `table`, `json`, `raw` and every field of the docker CLI.
+`--detach-keys` works for `attach`, `start -ai` and `run`; without a tty,
+Ctrl-C sends SIGINT to the container (`--sig-proxy`).
+
+### docker cp, stats, logs and events
+
+`docker cp` copies files and directories both ways, also `dir/.` and `-`
+for a tar. For a running container the page reads and writes the 9p tree of
+the VM in its worker (`cpfs.js`), so the image needs no `tar`; init first
+syncs and drops its caches (`{"sync": true}`), because the root is mounted
+with `cache=loose`. A stopped container has no VM: a worker rebuilds its
+image. What `docker cp` puts into a container is kept as tars under
+`/var/lib/containerd/io.tabernetes.docker-cp/<id>/` and goes on top of the
+image at every start.
+
+`docker stats` reads the kernel of each VM: init answers `{"stats": true}`
+with `/proc/stat`, `/proc/meminfo`, `/proc/net/dev` and the process count.
+BLOCK I/O is always 0: the root is 9p, not a block device.
+
+The console log is written in Docker's json-file format and rotated: 1 MiB
+x 3 files by default, or `--log-opt max-size/max-file`. This makes
+`docker logs --since/--until/-t/--tail` work. `logs -f` and attach take
+their output from the console stream, so a rotation does not break them.
+`docker events` keeps the last 256 events.
+
+### Volumes and bind mounts
+
+`docker volume create/ls/inspect/rm/prune`, `-v` and `--mount` (volume,
+bind, tmpfs) work like Docker. v86 has one 9p device, so a mount is a second
+v86 file system that the root file system of the VM mounts at the path
+(`FS.Mount`, `web/src/volumes.js`); the guest sees one tree. The files of a
+volume are in OPFS (`tabernetes/volumes/<name>/`: an index and a data file
+per file, never changed once written); its metadata is in
+`/var/lib/docker/volumes`, a kept path. The VM worker saves what changed
+every 2 s, before it reports the exit and when the page stops the VM. Two
+containers share a volume, but not live: a container sees the changes of
+others when it starts. A new empty volume gets the files of the image at
+the path (copy-up). `-v /path`, `--mount` without a source and the VOLUMEs
+of the image make anonymous volumes; `docker rm -v` and `--rm` remove them.
+A bind mount copies the files of the terminal (`/root/...`) into the VM at
+start and writes the changes of the container back every 2 s and at stop.
+`:ro` is a read-only bind remount by init, so writes fail with "Read-only
+file system". `forget`, `poweroff` and `reboot` delete the volumes. Pods on
+the tab node get `emptyDir` volumes the same way.
+
+### Tabs and saves
+
+Each docker CLI request carries `X-Tabernetes-Tab`, and a container runs in
+the tab that started it, so two tabs no longer race. A tab that is hidden or
+closing asks the shared worker to save the kept files at once. The data of
+containerd is saved 50 ms after a change, at most once per second: a bbolt
+commit dirties about 0.5 MB.
+
+### What the merge decided
+
+- One flag table for `docker run` (FLAGS' `dockerrunflags.go`); the attach
+  options of CMDS, the log options of OPS and `-v`/`--mount` of VOLS became
+  rows of it. `docker create` leaves out the attach options, like Docker.
+- The container state has both `Paused` and `Restarting`; a restarting
+  container shows as such before a paused one.
+- `docker rm` cancels restarts, removes the log files and the `docker cp`
+  files, and with `-v` the anonymous volumes.
+- One init with all the new requests (`ps`, `stats`, `sync`, `detachable`,
+  read-only remounts).
+- `docker system df` counts the volumes (size -1: Go cannot measure OPFS).
+
 ## Remaining limitations
 
 - **exec processes are not containerd processes**: their stdio cannot go
   through containerd's fifos in wasm, so the Docker API keeps its own exec
   store over init, as dockerd keeps its own exec store over containerd.
   This is by design.
-- `docker attach` without `-i` does not forward Ctrl-C (no `--sig-proxy`);
-  no `--detach-keys`; `ps --filter` and `--format json` are partial.
-- No `-P`/`--publish-all` (containerd does not see the image's
-  ExposedPorts at create time) and no IPv6 lines in `docker port`. A
-  restarted container asks for the host port it got the first time.
-- Kept files are saved 0.3 to 3 s after a change: a browser killed right
-  after a change loses it. Big logs have no size cap.
-- Two tabs that run `docker` at the same moment can race for which tab gets
-  the next container.
-- The init with the signal request is built from `vm/init/init.c` by the
-  `vm` task; a deployment needs the new `dist/vm/init` (saved VM states key
-  on a hash of init, so old states are not restored). `vm/test` (Linux
-  only) was not run on the Mac.
+- Not done: `docker build`, networks between containers (each VM reaches
+  only the outside through its own `fetch` relay), `compose`, `push` (no
+  registry takes writes from a browser), `docker update`.
+- Volumes: no live sharing between running VMs and no live sync from the
+  terminal into a running container; a changed file is saved whole.
+  `HostConfig.Binds` and `Mounts` are not in inspect. Volume sizes are not
+  known (`system df`).
+- `docker top` refuses a paused container (init is frozen with it).
+  `ancestor=` matches only the image itself. `docker images` has no
+  `--filter`. Port links keep the old name after `docker rename` until the
+  next start.
+- Files a stopped container wrote itself cannot be copied out: they lived
+  in its VM.
+- `-P` bindings also show in `HostConfig.PortBindings`.
+- No IPv6 lines in `docker port`.
+- The init with all the requests is built from `vm/init/init.c` by the `vm`
+  task; a deployment needs the new `dist/vm/init`. `vm/test` (Linux only)
+  was not run on the Mac.
 
 ## Resume commands
 
