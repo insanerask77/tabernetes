@@ -1,0 +1,59 @@
+# Tabernetes (the in-browser Kubernetes control plane) plus a local Docker
+# Hub mirror for the pods that run in browser tabs.
+#
+#   docker compose up -d --force-recreate --remove-orphans
+#
+# In Nginx Proxy Manager add ONE proxy host with an SSL certificate:
+#   tabernetes.madolell.com  ->  http://<server IP>:8977
+#
+# The page and the registry share that domain: the nginx inside the
+# tabernetes container sends /v2/ to the registry on port 5000. Same domain
+# means no CORS, so no extra nginx is needed.
+#
+# Log in once before the first up:
+#   docker login zot.madolell.com
+
+services:
+  tabernetes:
+    image: zot.madolell.com/tabernetes:latest
+    container_name: tabernetes
+    restart: unless-stopped
+    environment:
+      # Where the browser pulls images from: this same site (/v2/ goes to the
+      # registry). It is written into index.html on the first start, so after
+      # a change run "docker compose up -d --force-recreate".
+      REGISTRY: https://tabernetes.madolell.com
+      # The node image in the "docker run" that join prints (a copy of
+      # ghcr.io/jkroepke/tabernetes:1.9.0). Change it and recreate, no rebuild.
+      NODE_IMAGE: zot.madolell.com/tabernetes-node:1.9.0
+    ports:
+      - "8977:80"
+    depends_on:
+      - registry
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # Local pull-through cache of Docker Hub on port 5000 (only inside the
+  # compose network). The first pull of an image goes to Docker Hub, later
+  # pulls come from the copy on this server.
+  registry:
+    image: registry:2
+    container_name: tabernetes-registry
+    restart: unless-stopped
+    environment:
+      REGISTRY_PROXY_REMOTEURL: https://registry-1.docker.io
+      # Optional: a Docker Hub account raises the pull rate limit (anonymous
+      # pulls are limited per IP). Remove the "#" and fill in your user and
+      # an access token from hub.docker.com.
+      # REGISTRY_PROXY_USERNAME: your-docker-hub-user
+      # REGISTRY_PROXY_PASSWORD: your-docker-hub-access-token
+    volumes:
+      # Keep the cached images when the container is recreated.
+      - registry-data:/var/lib/registry
+
+volumes:
+  registry-data:
