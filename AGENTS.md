@@ -8,16 +8,16 @@ from the code. Read both before you change something.
 Tabernetes ("Kubernetes in your tab") is a real Kubernetes control plane
 (kube-apiserver, kube-controller-manager, kube-scheduler, kubectl) compiled
 to `js/wasm` and running in a browser tab, plus a Docker node image that joins
-the cluster over WebRTC. It is the demo on <https://jkroepke.de/tabernetes/>.
+the cluster over WebRTC. It is the demo on <https://rafamadolell.com/tabernetes/>.
 It was called "kwasm" until 2026-11-08; old commits, branches and notes use
 that name.
 
 ## Repository and release
 
 - Tabernetes lived in `tabernetes/` (before that `kwasm/`) of
-  [jkroepke/blog](https://github.com/jkroepke/blog). The history up to
-  `jkroepke/blog#154` was imported with `git filter-repo`, so `#123` in old
-  commit messages was rewritten to `jkroepke/blog#123`.
+  [rafamadolell/blog](https://github.com/rafamadolell/blog). The history up to
+  `rafamadolell/blog#154` was imported with `git filter-repo`, so `#123` in old
+  commit messages was rewritten to `rafamadolell/blog#123`.
 - The blog does not build Tabernetes anymore. It pins a release
   (`TABERNETES_VERSION` in the `mise.toml` of the blog, bumped by Renovate),
   downloads `tabernetes.tar.gz`, verifies its attestation, unpacks it into
@@ -254,7 +254,7 @@ that name.
 - **No registry sends CORS headers** (Docker Hub incl. auth and CDN, ghcr.io,
   quay.io, public.ecr.aws, mirror.gcr.io, registry.gitlab.com). There is no
   browser trick around it (`no-cors` is opaque). Tab pods pull through Joe's
-  Docker Hub pull-through mirror `https://tabernetes.oracle.jkroepke.de`
+  Docker Hub pull-through mirror `https://tabernetes.oracle.rafamadolell.com`
   (`registry:3` + a CORS middleware, GET/HEAD only). Its deployment files are
   private and must not be committed. Hugging Face sends CORS, so WebLLM
   weights load directly.

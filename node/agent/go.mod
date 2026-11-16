@@ -1,4 +1,4 @@
-module github.com/jkroepke/tabernetes/node/agent
+module github.com/rafamadolell/tabernetes/node/agent
 
 go 1.27.4
 
