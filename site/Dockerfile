@@ -22,16 +22,16 @@ COPY site/index.html /tmp/index.html
 # proxy-sw.js must be served at /tabernetes-proxy/sw.js, the scope of the
 # "proxy <port>" service worker.
 RUN mkdir -p /usr/share/nginx/html/tabernetes-proxy \
- && mv /usr/share/nginx/html/proxy-sw.js /usr/share/nginx/html/tabernetes-proxy/sw.js \
- && size=$(wc -c < /usr/share/nginx/html/tabernetes.wasm.zst | tr -d ' ') \
- && sed -i \
+  && mv /usr/share/nginx/html/proxy-sw.js /usr/share/nginx/html/tabernetes-proxy/sw.js \
+  && size=$(wc -c < /usr/share/nginx/html/tabernetes.wasm.zst | tr -d ' ') \
+  && sed -i \
       -e "s/__TABERNETES_WASM_SIZE__/${size}/g" \
       -e "s/__TABERNETES_WASM_MB__/$(( (size + 524288) / 1048576 ))/g" \
       /tmp/index.html \
- && mv /tmp/index.html /usr/share/nginx/html/index.html \
- # nginx runs as the user nginx: everything must be readable by it (dist/vm
- # can come out of "docker build --output" as 0700, and then /vm/* is a 404).
- && chmod -R a+rX /usr/share/nginx/html
+  && mv /tmp/index.html /usr/share/nginx/html/index.html \
+  # nginx runs as the user nginx: everything must be readable by it (dist/vm
+  # can come out of "docker build --output" as 0700, and then /vm/* is a 404).
+  && chmod -R a+rX /usr/share/nginx/html
 
 COPY site/nginx.conf /etc/nginx/conf.d/default.conf
 COPY site/entrypoint.sh /usr/local/bin/tabernetes-entrypoint.sh

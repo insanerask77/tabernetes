@@ -1,25 +1,30 @@
-# Docker Compose para el NODO de Tabernetes (kubelet + containerd + agente).
+# Docker Compose for a Tabernetes NODE (kubelet, containerd and the agent).
 #
-# Es la misma imagen que imprime `join` dentro del terminal del navegador, pero
-# arrancada con compose en vez de `docker run`. El nodo es efímero: vive lo que
-# dura la conexión WebRTC con el clúster del navegador.
+# It is the image that `join` prints in the terminal of the browser, started
+# with compose instead of `docker run`. The node does not last: it lives as
+# long as its WebRTC connection to the cluster in the browser.
 #
-# Uso:
-#   1. En el terminal de Tabernetes (navegador), ejecuta:  join
-#      Te imprime un `docker run ...` con un PUERTO y un TOKEN.
-#   2. Copia el puerto y el token y lanza el nodo aquí:
+# Usage:
+#   1. In the Tabernetes terminal (browser), run:  join
+#      It prints a `docker run ...` with a PORT and a TOKEN.
+#   2. Copy the port and the token and start the node here:
 #
 #        NODE_PORT=50001 TOKEN="<token>" \
 #          docker compose -f docker-compose.node.yml run --rm node
 #
-#   3. El nodo imprime una línea "accept ...". Pégala en el terminal del navegador.
+#   3. The node prints an "accept ..." line. Paste it into the terminal of
+#      the browser.
 #
-# Para un nodo en otra máquina de la LAN, añade --advertise antes del token:
+# For a node on another machine of the LAN, add --advertise before the token:
 #   command: ["--advertise", "${ADVERTISE_IP}", "${TOKEN}"]
+#
+# The image is on ghcr.io (the CI of insanerask77/tabernetes builds it). Use
+# the version of the page (`join` prints it) instead of latest when they
+# differ. While the package is private, run `docker login ghcr.io` first.
 
 services:
   node:
-    image: zot.madolell.com/tabernetes-node:1.9.0
+    image: ghcr.io/insanerask77/tabernetes:latest
     pull_policy: always
     stdin_open: true
     tty: true
@@ -28,16 +33,16 @@ services:
     security_opt:
       - seccomp=unconfined
       - systempaths=unconfined
-      # apparmor=unconfined   # solo hosts Linux con AppArmor (macOS no lo usa)
+      # apparmor=unconfined   # only Linux hosts with AppArmor (not macOS)
     devices:
       - /dev/net/tun:/dev/net/tun
     ports:
-      # El puerto viene del `join` (50000 + nº de nodo). Se publica solo en
-      # localhost, igual que el comando que imprime el navegador.
+      # The port comes from `join` (50000 + the node number). It listens on
+      # localhost only, like the command that the browser prints.
       - "127.0.0.1:${NODE_PORT:-50001}:${NODE_PORT:-50001}/udp"
     command: ["${TOKEN}"]
     volumes:
-      # Estado de containerd (imágenes descargadas), reutilizado entre joins.
+      # The state of containerd (pulled images), kept between joins.
       - containerd-data:/var/lib/containerd
 
 volumes:

@@ -4,9 +4,22 @@ This directory turns the `dist/` build output (the browser terminal with a
 Kubernetes control plane) into a small Docker image served by nginx, ready to
 host on a subdomain.
 
+## Prebuilt image
+
+Every release of insanerask77/tabernetes publishes the site image next to
+the node image:
+
+```bash
+docker run --rm -p 8080:80 ghcr.io/insanerask77/tabernetes-site:latest
+```
+
+`ghcr.io/insanerask77/tabernetes-site:<version>` holds the page of that
+release, and its `join` prints `ghcr.io/insanerask77/tabernetes:<version>`.
+While the packages are private, `docker login ghcr.io` first.
+
 ## Build
 
-The assets are not in this repository; build them first with mise:
+To build it yourself, build the assets first with mise:
 
 ```bash
 mise run build      # writes dist/ (the Wasm binary, the terminal, the workers, the VM)
@@ -20,7 +33,7 @@ docker build -f site/Dockerfile -t tabernetes-site .
 
 `dist/` is the only part of the build context that the image takes, plus this
 `site/` directory. A `.dockerignore` keeps the Kubernetes checkout, the node
-image sources and the git history out of the context.
+image sources and the Git history out of the context.
 
 ## Run
 
@@ -28,7 +41,7 @@ image sources and the git history out of the context.
 docker run --rm -p 8080:80 tabernetes-site
 ```
 
-Open http://localhost:8080 and click **Boot the cluster**. The Wasm binary is
+Open <http://localhost:8080> and click **Boot the cluster**. The Wasm binary is
 ~290 MB (28 MB zstd), so the first download takes a moment; the browser caches
 it.
 
@@ -50,7 +63,7 @@ Deployment + Service + Ingress.
   `join` command and the `llm` feature (Hugging Face sends CORS) work without it.
 - **The binary is cached in the browser by URL.** The page stores it in Cache
   Storage keyed by the file URL and never revalidates. When you rebuild and
-  redeploy, either keep the old URL (it stays stale) or change the file name
+  redeploy, either keep the old URL (it stays stale) or change the filename
   and the `data-wasm` attribute so browsers fetch the new one.
 - **No `Content-Encoding` for the `.zst`.** The page decompresses the zstd
   frames itself. nginx serves the file raw (see `nginx.conf`), so the download

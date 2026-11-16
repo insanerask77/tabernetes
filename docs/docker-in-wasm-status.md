@@ -8,12 +8,12 @@ current state and the next step.
 
 - `mise` and `go 1.27.4` are installed.
 - Kubernetes v1.37.2 is cloned at `.build/kubernetes` (gitignored).
-- containerd is cloned at `.build/containerd` (gitignored), with the js/wasm
+- containerd is cloned at `.build/containerd` (gitignored), with the `js/wasm`
   port applied and committed as a diff in `k8s/containerd-js.patch`.
 
 ## What is done and verified
 
-- **containerd → wasm**: `GOOS=js GOARCH=wasm go build ./cmd/containerd` works
+- **containerd → Wasm**: `GOOS=js GOARCH=wasm go build ./cmd/containerd` works
   (in `.build/containerd`).
 - **containerd trimmed** (the "option 3" approach) so it compiles against
   Kubernetes' older dependency versions. The newer-API uses were removed or
@@ -27,7 +27,7 @@ current state and the next step.
     (`Translate` + `PrepareRootfs`), `inprocess` (in-process `ShimInstance`),
     `dockerapi` (thin Docker Engine API). Tests pass.
 - **`k8s/tabernetes/docker.go` + `dockercli.go` + `coreutils.go`**: the
-  `docker` shell builtin (pure-stdlib HTTP client to the `dockerapi`).
+  `docker` shell built-in (pure-stdlib HTTP client to the `dockerapi`).
 - **`web/src/vmworker.js`**: `startRootfs` (boot a VM from a prepared rootfs).
 
 ## The vendoring works (2026-11-13)
@@ -42,9 +42,9 @@ with the daemon wired.)
 What was wrong, and the rules `k8s/patch.go` now follows (tests in
 `k8s/patch_test.go`):
 
-- **modules.txt has no blank lines between blocks.** `removeModuleBlock`
+- **modules.txt has no empty lines between blocks.** `removeModuleBlock`
   removed everything from the target block to the end of the file. A block
-  now ends at the next `# ` header (`moduleBlock`), and `setModule` inserts
+  now ends at the next header line, a `#` and a space (`moduleBlock`), and `setModule` inserts
   new blocks in sort order.
 - **The `go X` annotation must stay.** Without `## explicit; go X` the
   compiler builds a vendored module as go1.16 (no generics). `parseModules`
@@ -53,7 +53,7 @@ What was wrong, and the rules `k8s/patch.go` now follows (tests in
 - **Shared modules miss packages.** Kubernetes vendors only the packages it
   uses. `addPackages` adds the ones containerd lists, from the module cache at
   the checkout's version. Packages that version does not have are left out
-  and logged (all Windows, test or otel semconv packages, unused on js/wasm).
+  and logged (all Windows, test or otel semconv packages, unused on `js/wasm`).
 - **The patch edits shared modules too.** The bbolt files of
   `containerd-js.patch` are copied over the checkout's bbolt (same v1.5.0;
   the patcher fails if the versions ever differ).
@@ -65,14 +65,14 @@ What was wrong, and the rules `k8s/patch.go` now follows (tests in
   apiextensions-apiserver require logrus).
 - An overwritten module first loses the .go files of its old version.
 
-## docker run works in the browser (2026-11-13)
+## `docker run` works in the browser (2026-11-13)
 
 The first `docker` command in the terminal starts containerd in the shared
 worker (`ensureDocker` in `k8s/tabernetes/docker.go`), and every command
 makes its tab the one that runs new containers. Tested in headless Brave
 against a local bundle: `docker run nginx` (about 25 s with the pull and the
 boot), `docker ps`, `docker logs` (the real nginx output), `docker stop`,
-`docker rm` (refused while running, like Docker), ids by unique prefix,
+`docker rm` (refused while running, like Docker), IDs by unique prefix,
 `docker run alpine echo hello` (Cmd replaces the CMD of the image), and a
 Kubernetes pod running next to a Docker container in the same tab.
 
@@ -84,7 +84,7 @@ What it took, in `k8s/containerd-js.patch` unless noted:
 - **`core/runtime/v2/v86/daemon`**: starts containerd in-process with a
   subset of the plugins of `cmd/containerd/builtins` (no CRI, NRI, erofs,
   blockfile, restart, debug or metrics). `daemon_test.go` runs the whole
-  path on js/wasm in Node.js: daemon, grpc, tasks service, in-process shim,
+  path on `js/wasm` in Node.js: daemon, gRPC, tasks service, in-process shim,
   runtime, and the Docker API.
 - **New shims go in-process too.** `InProcessShimLoader` only covered the
   reload of old shims; `ShimManager.Start` still forked. Both now use
@@ -103,7 +103,7 @@ What it took, in `k8s/containerd-js.patch` unless noted:
   (Cmd, Env, WorkingDir, Tty), so the VM worker uses the ENTRYPOINT, CMD, env
   and working dir of the image. Before, an empty Cmd became `/bin/sh`.
 - **Network**: each VM gets 172.17.0.x, gateway 172.17.0.1, hostname = short
-  id, like Docker's default bridge (each VM has its own virtual network).
+  ID, like Docker's default bridge (each VM has its own virtual network).
 - **Logs**: the runtime writes the console to `/var/log/v86/<id>.log`
   (`v86.LogPath`); `GET /containers/{id}/logs` sends it as a multiplexed
   stream, and `docker logs` in `dockercli.go` reads it.
@@ -114,7 +114,7 @@ What it took, in `k8s/containerd-js.patch` unless noted:
   every new file under any `containerd/` directory from `git add -A`. It is
   `/containerd` now. Check the file count of the patch after regenerating it.
 
-## docker run -it and docker exec (2026-11-13)
+## `docker run -it` and `docker exec` (2026-11-13)
 
 Tested in headless Brave by typing in the terminal, as a user would (calling
 `tabernetesTerminal.exec` does not route the keys to a running command):
@@ -145,7 +145,7 @@ How it works:
   containerd's exec: containerd does not know these processes.
 - **`v86.Streamer`** is the interface between the Docker API and that glue
   (`dockerStreams` in `docker.go`). The API (`dockerapi/stream.go`) serves
-  attach, resize, exec, exec start/resize/json with the hijacked connection
+  attach, resize, exec, exec start/resize/JSON with the hijacked connection
   of the Docker API: raw with a tty, multiplexed without.
 - `/etc/hostname` is the hostname now (`vmworker.js`), for pods too; it was
   the file of the image.
@@ -173,7 +173,7 @@ whole: `run -d -p`, `ps`, `port`, `kill -s HUP`, `exec -i` with a pipe,
 SIGTERM (2.02 s, exit 137), `ps -a`, `start` with its port, `images`,
 `run -it`, `start -ai`, a reload (containers kept, logs kept) and `rm -f`.
 
-### docker run -p
+### `docker run -p`
 
 `docker run -p 8080:80 nginx` publishes a container port like Docker. The
 Docker API keeps the bindings in the container label
@@ -208,20 +208,20 @@ stopped the same way, as the kubelet does: event `Killing` "Stopping
 container X", the stop signal, up to the grace period (at least 2 s), then
 SIGKILL. Init gets signals as the request `{"signal": N}` on its exec port.
 SIGKILL ends every process in the VM but init, like the end of a PID
-namespace. On js/wasm, `syscall.SIGKILL` is 3 and `syscall.SIGTERM` is 6:
+namespace. On `js/wasm`, `syscall.SIGKILL` is 3 and `syscall.SIGTERM` is 6:
 the old code sent those numbers to the VM and faked the exit codes.
 
-### Everyday docker commands
+### Everyday Docker commands
 
 `docker ps` (`-a`, `-q`, `-l`, `-n`, `--no-trunc`, `--format`), `inspect`
 (`-f`), `create`, `start` (`-a`, `-i`), `restart` (`-t`), `attach`,
 `images`, `pull`, `rmi` (`-f`), `port`, `docker container …`,
 `docker image …` and `docker help` work like Docker, with its texts, flags
-and tables (taken from docker/cli v28 and dockerd). A container id is 64
-random hex digits and the containerd id. A container without `--name` gets
+and tables (taken from docker/cli v28 and dockerd). A container ID is 64
+random hex digits and the containerd ID. A container without `--name` gets
 a name like Docker's (`kind_mahavira`), from `crypto/rand`, because the heap
-snapshot would repeat `math/rand`. Commands find a container by id, name or
-unique id prefix. The VM of a task does not last, so labels on the
+snapshot would repeat `math/rand`. Commands find a container by ID, name or
+unique ID prefix. The VM of a task does not last, so labels on the
 containerd container keep the name, the config of the image and the state
 of the last run (start, end, exit code). When a task exits, the API writes
 these labels and deletes the task, which frees the VM; `docker stop` and
@@ -263,7 +263,7 @@ all with the rest of the database.
   own wait on the task.
 - B's `stop` and `kill` wait for C's watcher (`waitRun`) and take a task
   that is already gone as stopped (C deletes the task when it ends).
-- C's random ids broke A's assumption that the id is the name: the port
+- C's random IDs broke A's assumption that the ID is the name: the port
   links and dockerd's "endpoint" message now get the name from the label
   (`PortPublisher.Publish(id, name, ports)`), and a port error is not
   prefixed with "failed to create task" (dockerd sets up the network
@@ -283,14 +283,14 @@ rename, wait, filters, logs, events, tag, a reload) and a regression test
 (a pod with port-forward, an `emptyDir` pod, `stop -t 2` = 137 in 2.02 s,
 `stop` = 143, `run -it` with Ctrl-P Ctrl-Q, `attach`, `exit 7`, `start -ai`).
 
-### docker run options
+### `docker run` options
 
 `-w`, `-u`, `-h`, `--entrypoint` (`""` resets it), `-l`, `--label-file`,
 `--env-file` (Docker's format: comments, a bare `KEY` takes the value of the
 shell), `-m`, `-P`, `--restart`, `--init`, `-a`, `--stop-signal`,
 `--stop-timeout`, `--detach-keys`, `--sig-proxy`, `--log-driver`,
 `--log-opt`, `-v` and `--mount` work on `docker run` (and on `docker create`
-without the attach options), with the parser and the messages of the docker
+without the attach options), with the parser and the messages of the Docker
 CLI (`dockerrunflags.go`). The user and the entrypoint go to the VM as the
 annotations `dev.tabernetes.v86.user` and `dev.tabernetes.v86.entrypoint`.
 As in dockerd, an entrypoint drops the CMD of the image too. A missing
@@ -325,11 +325,11 @@ store of the browser. Container sizes are 0B: what a container writes lives
 in its VM.
 
 `docker ps --filter` works in the Docker API with dockerd's rules, and
-`--format` takes `table`, `json`, `raw` and every field of the docker CLI.
+`--format` takes `table`, `json`, `raw` and every field of the Docker CLI.
 `--detach-keys` works for `attach`, `start -ai` and `run`; without a tty,
 Ctrl-C sends SIGINT to the container (`--sig-proxy`).
 
-### docker cp, stats, logs and events
+### `docker cp`, `stats`, `logs` and `events`
 
 `docker cp` copies files and directories both ways, also `dir/.` and `-`
 for a tar. For a running container the page reads and writes the 9p tree of
@@ -372,13 +372,13 @@ the tab node get `emptyDir` volumes the same way.
 
 ### Tabs and saves
 
-Each docker CLI request carries `X-Tabernetes-Tab`, and a container runs in
+Each Docker CLI request carries `X-Tabernetes-Tab`, and a container runs in
 the tab that started it, so two tabs no longer race. A tab that is hidden or
 closing asks the shared worker to save the kept files at once. The data of
 containerd is saved 50 ms after a change, at most once per second: a bbolt
 commit dirties about 0.5 MB.
 
-### What the merge decided
+### What the second merge decided
 
 - One flag table for `docker run` (FLAGS' `dockerrunflags.go`); the attach
   options of CMDS, the log options of OPS and `-v`/`--mount` of VOLS became
@@ -394,7 +394,7 @@ commit dirties about 0.5 MB.
 ## Remaining limitations
 
 - **exec processes are not containerd processes**: their stdio cannot go
-  through containerd's fifos in wasm, so the Docker API keeps its own exec
+  through containerd's fifos in Wasm, so the Docker API keeps its own exec
   store over init, as dockerd keeps its own exec store over containerd.
   This is by design.
 - Not done: `docker build`, networks between containers (each VM reaches

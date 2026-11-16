@@ -9,7 +9,7 @@ lives in `.build/containerd` (gitignored) and is not integrated yet.
 
 Do not reimplement Docker. Compile the real pieces to WebAssembly:
 
-- **containerd** manages images, snapshots and tasks. It compiles to wasm
+- **containerd** manages images, snapshots and tasks. It compiles to Wasm
   (proven below).
 - **A v86 runtime shim** replaces runc. Each containerd task runs in a v86 VM,
   not in a Linux process.
@@ -22,7 +22,7 @@ Do not reimplement Docker. Compile the real pieces to WebAssembly:
 dockerd is a thin layer over containerd, but its daemon is Linux networking
 (iptables, netlink, conntrack), storage (overlayfs, btrfs) and the container
 runtime (cgroups, seccomp, namespaces). All of that is `//go:build linux`, so on
-wasm every such package is "build constraints exclude all Go files". Stubbing
+Wasm every such package is "build constraints exclude all Go files". Stubbing
 them gives a dockerd whose core does nothing, which cannot map ports or isolate
 processes. It is a much bigger port than containerd for a useless result. The
 thin API over containerd gets the same user experience without that work.
@@ -38,15 +38,15 @@ cgroups, seccomp) are already behind build tags.
 The stubs cover:
 
 - bbolt: mmap (read-only, so it is a file read), flock, mlock.
-- device nodes, FIFOs, unix sockets and SCM_RIGHTS.
+- device nodes, FIFOs, Unix sockets and SCM_RIGHTS.
 - signals, xattrs, user/group lookup, `exec`, wait4.
 - mount, and the `defaults.*` constants (address, fifo dir, snapshotter, ...).
 
-## Running the daemon on wasm
+## Running the daemon on Wasm
 
-containerd's control sockets (grpc, ttrpc, debug) are unix sockets, which do not
-exist in wasm. They map onto fixed ports of the in-process fake TCP network
-(`defaults.MapAddress`): grpc `127.0.0.1:10000`, ttrpc `127.0.0.1:10001`, debug
+containerd's control sockets (gRPC, ttrpc, debug) are Unix sockets, which do not
+exist in Wasm. They map onto fixed ports of the in-process fake TCP network
+(`defaults.MapAddress`): gRPC `127.0.0.1:10000`, ttrpc `127.0.0.1:10001`, debug
 `127.0.0.1:10002`. The daemon (`pkg/sys`) listens and the client (`pkg/dialer`)
 dials the same ports, so containerd's client and daemon talk over `127.0.0.1`.
 
@@ -65,7 +65,7 @@ The `Runtime`/`Handle` interface is the seam to the tab node's v86 VM
 Stats, Update, Pids) are no-ops or `ErrNotImplemented`, because a VM has no
 cgroups.
 
-`jsruntime` is the js/wasm implementation of that seam:
+`jsruntime` is the `js/wasm` implementation of that seam:
 
 - `Translate` turns an OCI spec into a `VMRequest` (rootfs, resolved argv, env,
   cwd, tty, memory limit, and the image ref from the annotation
@@ -74,7 +74,7 @@ cgroups.
 - `js.go` drives the VM worker over `syscall/js`, using the same `vm.start`
   protocol as `k8s/tabernetes/v86.go`.
 
-Both packages have unit tests and compile for wasm.
+Both packages have unit tests and compile for Wasm.
 
 ## The thin Docker API (`core/runtime/v2/v86/dockerapi`)
 
@@ -86,13 +86,13 @@ and networking are not wired yet.
 
 ## The shim in-process (`core/runtime/v2/v86/inprocess`)
 
-containerd's shim manager forks shim binaries; wasm has no fork. This package
+containerd's shim manager forks shim binaries; Wasm has no fork. This package
 starts the v86 task service over a ttrpc server on the in-process fake TCP
 network and returns a `ShimInstance` that talks to it, the same way the fork
-path talks to a forked shim over a unix socket. `core/runtime/v2` grew an
+path talks to a forked shim over a Unix socket. `core/runtime/v2` grew an
 `InProcessShimLoader` hook: when set, `ShimManager.Start` and `loadShim` use
 the in-process shim instead of forking. `v86/daemon` sets it to
-`inprocess.New` with the js/wasm `Runtime`. The package has a test that runs Create/Start/State/Delete
+`inprocess.New` with the `js/wasm` `Runtime`. The package has a test that runs Create/Start/State/Delete
 through ttrpc against a fake runtime.
 
 ## Two paths for the rootfs
@@ -125,7 +125,7 @@ The mechanical parts are now in the repository:
 - `mise.toml` gained `CONTAINERD_COMMIT`.
 - `k8s/tabernetes/docker.go` is the glue: it sets `InProcessShimLoader`, creates
   the client, and serves the Docker Engine API. It also registers a `docker`
-  builtin (in `coreutils.go`).
+  built-in (in `coreutils.go`).
 
 The first `docker` command starts containerd (`ensureDocker`); the daemon
 itself is `core/runtime/v2/v86/daemon` in the patch.

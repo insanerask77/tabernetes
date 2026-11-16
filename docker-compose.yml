@@ -10,12 +10,14 @@
 # tabernetes container sends /v2/ to the registry on port 5000. Same domain
 # means no CORS, so no extra nginx is needed.
 #
-# Log in once before the first up:
-#   docker login zot.madolell.com
+# The images are on ghcr.io (the CI of insanerask77/tabernetes builds them).
+# While the packages are private, log in once before the first up with a
+# token that can read packages:
+#   docker login ghcr.io -u insanerask77
 
 services:
   tabernetes:
-    image: zot.madolell.com/tabernetes:latest
+    image: ghcr.io/insanerask77/tabernetes-site:latest
     container_name: tabernetes
     restart: unless-stopped
     environment:
@@ -23,9 +25,10 @@ services:
       # registry). It is written into index.html on the first start, so after
       # a change run "docker compose up -d --force-recreate".
       REGISTRY: https://tabernetes.madolell.com
-      # The node image in the "docker run" that join prints (a copy of
-      # ghcr.io/insanerask77/tabernetes). Change it and recreate, no rebuild.
-      NODE_IMAGE: zot.madolell.com/tabernetes-node:1.9.0
+      # The node image in the "docker run" that join prints. Empty: the one
+      # built into the page, ghcr.io/insanerask77/tabernetes with the version
+      # of the release. Change it and recreate, no rebuild.
+      NODE_IMAGE: ""
     ports:
       - "8977:80"
     depends_on:

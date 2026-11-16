@@ -147,6 +147,70 @@ jobs:
           # latest for local builds.
           tags: ${{ steps.version.outputs.tags }}
 
+  # The page of a release served by nginx (site/Dockerfile), with the bundle
+  # that the build job packed. Only a release pushes, like the node image.
+  site-image:
+    name: Site image
+    runs-on: ubuntu-26.04
+    needs:
+      - build
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tabernetes
+          path: .build
+
+      - name: Unpack bundle
+        run: |
+          mkdir -p dist
+          tar -xzf .build/tabernetes.tar.gz -C dist
+
+      - name: Tags
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "${REF_TYPE}" = "tag" ]; then
+            echo "tags=ghcr.io/insanerask77/tabernetes-site:${REF_NAME#v},ghcr.io/insanerask77/tabernetes-site:latest" >> "${GITHUB_OUTPUT}"
+          else
+            echo "tags=ghcr.io/insanerask77/tabernetes-site:latest" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Login to ghcr.io
+        if: github.ref_type == 'tag'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: site/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.ref_type == 'tag' }}
+          provenance: mode=max
+          sbom: true
+          tags: ${{ steps.version.outputs.tags }}
+
   super-lint:
     name: super-lint
     runs-on: ubuntu-26.04
@@ -242,6 +306,7 @@ jobs:
     needs:
       - build
       - image
+      - site-image
       - super-lint
     runs-on: ubuntu-26.04
     permissions:

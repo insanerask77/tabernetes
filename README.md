@@ -336,6 +336,8 @@ tag from them and starts CI on it (a tag pushed with `GITHUB_TOKEN` does not
 start workflows by itself, a `workflow_dispatch` does). The tag run builds `dist/`, pushes the node image
 as `ghcr.io/insanerask77/tabernetes:<version>` and `:latest`, and publishes the
 GitHub release with `tabernetes.tar.gz` and a build provenance attestation.
+It also pushes `ghcr.io/insanerask77/tabernetes-site:<version>` and
+`:latest`, the page of the release served by nginx (`site/`).
 The bundle of a release prints `docker run` with the node image of the same
 version. `Create Tag` (`.github/workflows/tag.yaml`) tags by hand.
 

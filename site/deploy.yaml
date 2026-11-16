@@ -19,8 +19,11 @@ spec:
     spec:
       containers:
         - name: tabernetes
-          image: tabernetes-site:latest
-          imagePullPolicy: IfNotPresent
+          # built by the CI of insanerask77/tabernetes for every release;
+          # pin a version (ghcr.io/insanerask77/tabernetes-site:1.0.0) to
+          # keep the page and its node image together
+          image: ghcr.io/insanerask77/tabernetes-site:latest
+          imagePullPolicy: Always
           ports:
             - containerPort: 80
 ---
