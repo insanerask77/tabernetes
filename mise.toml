@@ -21,6 +21,10 @@ NODE_IMAGE = "ghcr.io/jkroepke/tabernetes"
 # The shell of the terminal, vendored into the Kubernetes checkout by k8s/patch.go.
 # renovate: go=mvdan.cc/sh/v3
 MVDAN_SH_VERSION = "v3.14.1"
+# containerd, vendored into the Kubernetes checkout by k8s/patch.go (the
+# docker-in-wasm spike). Pin the exact commit: k8s/containerd-js.patch is a
+# diff against it and must be regenerated when this moves.
+CONTAINERD_COMMIT = "d83dc3d5c93d6dbfe53115b1206bb1fbf90c4e4d"
 
 [tasks.checkout]
 description = "Clone Kubernetes at KUBERNETES_VERSION into .build/kubernetes"

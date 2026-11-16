@@ -3,6 +3,8 @@
 /.build/
 /web/node_modules/
 /web/src/wasm_exec.js
+# "go build" in k8s/ (the patch command)
+/k8s/tabernetes-overlay
 
 /.idea/
 .DS_Store
