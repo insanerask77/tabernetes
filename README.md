@@ -345,7 +345,8 @@ The repository variable `RELEASES_ENABLED` (Settings, Secrets and variables,
 Actions, Variables) switches the automatic releases on. Only the value `true`
 creates releases; without it, changes on `main` wait for the next release.
 
-Check a download with:
+While the repository is private, GitHub keeps no attestation and the
+release has none. Once it is public, check a download with:
 
 ```bash
 gh attestation verify tabernetes.tar.gz --repo insanerask77/tabernetes

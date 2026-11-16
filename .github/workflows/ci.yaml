@@ -320,7 +320,11 @@ jobs:
           name: tabernetes
           path: dist
 
+      # GitHub keeps attestations only for public repositories (and for
+      # private ones of organizations): skip it while the repository is a
+      # private repository of a user.
       - name: Attest bundle
+        if: ${{ !github.event.repository.private }}
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: dist/tabernetes.tar.gz
