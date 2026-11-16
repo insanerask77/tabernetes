@@ -1,7 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "github>rafamadolell/renovate-config",
+    "github>jkroepke/renovate-config",
     "group:all"
   ],
   "packageRules": [

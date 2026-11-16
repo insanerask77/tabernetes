@@ -6,8 +6,8 @@ kube-controller-manager, kube-scheduler and kubectl are compiled with
 [rafamadolell.com/tabernetes](https://rafamadolell.com/tabernetes/) boots it in a terminal.
 A real node can join with Docker. The node talks to the browser over WebRTC.
 
-Tabernetes started as a part of [my blog](https://github.com/rafamadolell/blog)
-(the history up to `rafamadolell/blog#154` comes from there). This repository
+Tabernetes started as a part of [the blog of Jan-Otto Kröpke](https://github.com/jkroepke/blog)
+(the history up to `jkroepke/blog#154` comes from there). This repository
 builds it and publishes every version as a GitHub release; the blog downloads
 a pinned release when it builds.
 
@@ -300,7 +300,7 @@ container images needs Docker.
 mise run build       # everything into dist/
 mise run test        # etcd shim tests, shell tests, VM init tests, go vet of the agent
 mise run dist        # dist/ packed into .build/tabernetes.tar.gz, the asset of a release
-mise run node-image  # ghcr.io/rafamadolell/tabernetes:latest for the local platform
+mise run node-image  # ghcr.io/insanerask77/tabernetes:latest for the local platform
 ```
 
 The first build clones Kubernetes into `.build/kubernetes` and takes a few
@@ -334,7 +334,7 @@ Releases are automatic. Pull request titles follow
 [semantic-release](https://semantic-release.gitbook.io/) creates the next
 tag from them and starts CI on it (a tag pushed with `GITHUB_TOKEN` does not
 start workflows by itself, a `workflow_dispatch` does). The tag run builds `dist/`, pushes the node image
-as `ghcr.io/rafamadolell/tabernetes:<version>` and `:latest`, and publishes the
+as `ghcr.io/insanerask77/tabernetes:<version>` and `:latest`, and publishes the
 GitHub release with `tabernetes.tar.gz` and a build provenance attestation.
 The bundle of a release prints `docker run` with the node image of the same
 version. `Create Tag` (`.github/workflows/tag.yaml`) tags by hand.
@@ -346,7 +346,7 @@ creates releases; without it, changes on `main` wait for the next release.
 Check a download with:
 
 ```bash
-gh attestation verify tabernetes.tar.gz --repo rafamadolell/tabernetes
+gh attestation verify tabernetes.tar.gz --repo insanerask77/tabernetes
 ```
 
 The binary is around 290 MB, or 28 MB with zstd (gzip: 45 MB). GitHub Pages

@@ -24,7 +24,7 @@ services:
       # a change run "docker compose up -d --force-recreate".
       REGISTRY: https://tabernetes.madolell.com
       # The node image in the "docker run" that join prints (a copy of
-      # ghcr.io/jkroepke/tabernetes:1.9.0). Change it and recreate, no rebuild.
+      # ghcr.io/insanerask77/tabernetes). Change it and recreate, no rebuild.
       NODE_IMAGE: zot.madolell.com/tabernetes-node:1.9.0
     ports:
       - "8977:80"

@@ -14,10 +14,14 @@ that name.
 
 ## Repository and release
 
+- This copy lives at [insanerask77/tabernetes](https://github.com/insanerask77/tabernetes),
+  a fork of [jkroepke/tabernetes](https://github.com/jkroepke/tabernetes)
+  (the git remote `upstream`). CI publishes the node image as
+  `ghcr.io/insanerask77/tabernetes` and makes releases only in this fork.
 - Tabernetes lived in `tabernetes/` (before that `kwasm/`) of
-  [rafamadolell/blog](https://github.com/rafamadolell/blog). The history up to
-  `rafamadolell/blog#154` was imported with `git filter-repo`, so `#123` in old
-  commit messages was rewritten to `rafamadolell/blog#123`.
+  [jkroepke/blog](https://github.com/jkroepke/blog). The history up to
+  `jkroepke/blog#154` was imported with `git filter-repo`, so `#123` in old
+  commit messages was rewritten to `jkroepke/blog#123`.
 - The blog does not build Tabernetes anymore. It pins a release
   (`TABERNETES_VERSION` in the `mise.toml` of the blog, bumped by Renovate),
   downloads `tabernetes.tar.gz`, verifies its attestation, unpacks it into
