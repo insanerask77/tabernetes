@@ -30,10 +30,11 @@ const isDir = (n) => (n.mode & S_IFMT) === S_IFDIR;
 const isLink = (n) => (n.mode & S_IFMT) === S_IFLNK;
 
 // What survives a reload: the files of the terminal, and Docker's: the data
-// and the state of containerd and the consoles of the containers
+// and the state of containerd, the consoles of the containers and the
+// metadata of the volumes, whose files are in OPFS (volumes.js)
 // (k8s/tabernetes/docker.go has the same paths). The kubeconfig belongs to
 // the cluster of this visit.
-export const keptPaths = ["/root", "/var/lib/containerd", "/run/containerd", "/var/log/v86"];
+export const keptPaths = ["/root", "/var/lib/containerd", "/run/containerd", "/var/log/v86", "/var/lib/docker"];
 const skippedPaths = ["/root/.kube"];
 
 // A file up to CHUNK bytes is saved as one record. A bigger one is a record
@@ -43,6 +44,13 @@ const skippedPaths = ["/root/.kube"];
 // Saving all of such a file after every change would write it again and
 // again.
 export const CHUNK = 64 << 10;
+
+// The data of containerd changes with the state of a container: it is saved
+// SOON ms after a change, not up to 3 s later as other kept files, but at
+// most once per SOON_GAP ms: a bbolt commit dirties about 0.5 MB of
+// chunks, and docker run, stop and rm each commit several times.
+const SOON_PATHS = ["/var/lib/containerd", "/run/containerd"];
+const SOON = 50, SOON_GAP = 1000;
 
 // markDirty notes that bytes [from, to) of a file changed since the last
 // save. n.dirty is a Set of chunk numbers, or undefined for all of them (a
@@ -122,22 +130,35 @@ export function createFS({ cwd = "/", onOutput = () => {}, persist = null } = {}
   // changed paths, saved together a moment after the last change, but no
   // later than a few seconds after the first one: a program that writes all
   // the time (a download with wget, a log) would put the save off forever.
-  // A reload right after a change, from vi say, saves on pagehide.
+  // A reload right after a change, from vi say, saves on pagehide, and a
+  // tab that is hidden saves too (the tab asks the shared worker, tabs.js).
+  // The data of containerd changes when a container is created, started,
+  // stopped or removed: it is saved after SOON ms, so that a container
+  // survives a reload that comes right after docker run.
   const changed = new Set();
-  let timer = 0, since = 0;
-  if (persist && typeof addEventListener === "function") addEventListener("pagehide", () => changed.size && flush());
+  let timer = 0, since = 0, soonDue = Infinity, lastFlush = 0;
+  if (persist && typeof addEventListener === "function") {
+    addEventListener("pagehide", () => changed.size && flush());
+    if (typeof document === "object") addEventListener("visibilitychange", () => document.visibilityState === "hidden" && changed.size && flush());
+  }
   const abs = (path) => "/" + split(path).join("/");
   // below a path of keep: these are always there
   const kept = (path) => persist && persist.keep.some((k) => path.startsWith(k + "/")) &&
     !persist.skip.some((s) => path === s || path.startsWith(s + "/"));
+  const soon = (path) => SOON_PATHS.some((k) => path.startsWith(k + "/"));
   const touch = (path) => {
     if (!persist) return;
     path = abs(path);
     if (!kept(path)) return;
-    if (!changed.size) since = Date.now();
+    const now = Date.now();
+    if (!changed.size) since = now;
     changed.add(path);
+    // a change of containerd's data must be saved by soonDue, whatever
+    // changes after it
+    if (soon(path)) soonDue = Math.min(soonDue, Math.max(now + SOON, lastFlush + SOON_GAP));
+    const at = Math.min(now + 300, since + 3000, soonDue);
     clearTimeout(timer);
-    timer = setTimeout(flush, Math.max(0, Math.min(300, since + 3000 - Date.now())));
+    timer = setTimeout(flush, Math.max(0, at - now));
   };
   // record is a directory, a link, or a small file with its data.
   // fileRecords are those of a file: a big one has its size and the number
@@ -166,6 +187,9 @@ export function createFS({ cwd = "/", onOutput = () => {}, persist = null } = {}
   };
   function flush() {
     clearTimeout(timer);
+    timer = 0;
+    soonDue = Infinity;
+    lastFlush = Date.now();
     const put = [], del = [];
     // all: below a changed directory (moved, say) every chunk is new
     const walk = (path, n, all) => {
@@ -181,8 +205,14 @@ export function createFS({ cwd = "/", onOutput = () => {}, persist = null } = {}
       else del.push(path);
     }
     changed.clear();
-    if (put.length || del.length) persist.save(put, del).catch((e) => console.warn("tabernetes: saving files:", e));
+    if (!put.length && !del.length) return;
+    stats.saves++;
+    stats.records += put.length + del.length;
+    for (const r of put) stats.bytes += r.data ? r.data.length : 0;
+    persist.save(put, del).catch((e) => console.warn("tabernetes: saving files:", e));
   }
+  // how much the saves cost, for measurements
+  const stats = { saves: 0, records: 0, bytes: 0 };
 
   // resize is truncate: a file that grows gets zeros.
   const resize = (n, len) => {
@@ -320,6 +350,10 @@ export function createFS({ cwd = "/", onOutput = () => {}, persist = null } = {}
   };
 
   const fs = { constants };
+  // save what changed now (a tab that goes away, cluster.js), and what the
+  // saves cost so far
+  fs.flush = () => { if (changed.size) flush(); };
+  fs.saveStats = stats;
   for (const [name, fn] of Object.entries(ops)) {
     fs[name] = (...args) => {
       const cb = args.pop();

@@ -115,6 +115,8 @@ func (s *session) register() {
 	if _, err := s.startNode(ctx); err != nil {
 		s.status("this tab is no node: " + err.Error())
 	}
+	// containers with a restart policy come back with the page (docker.go)
+	dockerAutostart(s)
 }
 
 // startNode registers the node of the tab, once. After a failure, the next

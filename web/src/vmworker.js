@@ -14,12 +14,14 @@
 // layers stay in the browser: a second pull finds the image "already present
 // on machine", in every tab and after a reload.
 import { V86 } from "v86";
-import { Tree, LayerStorage, modes, statRoot } from "./rootfs.js";
+import { Tree, LayerStorage, modes, statRoot, addWorkingDir } from "./rootfs.js";
 import { openStore, imageFSCapacity } from "./layers.js";
 import { SHA256 } from "./sha256.js";
 import { initramfs } from "./initramfs.js";
 import { bootKernel } from "./kernelboot.js";
 import { buildID, loadState, saveState, dropState } from "./vmstate.js";
+import { v86View, treeView, readFiles, statFile, writeFiles, addFiles } from "./cpfs.js";
+import { prepareMounts, attachMounts, readonlyPaths, volumeReaders, memReaders, copyStorage, removeVolume, SYNC_EVERY } from "./volumes.js";
 
 const post = (m, transfer) => self.postMessage(m, transfer || []);
 const CACHE = "tabernetes-configs"; // the configs of the images, small JSON blobs
@@ -291,12 +293,14 @@ async function unpackImage(p, ref, imageID, m, onFetching, checkArch = false, pr
 
 // describe is an image as docker images and docker inspect show it (Image
 // in dockerapi/images.go). sizes are those of the unpacked layers.
-function describe(name, imageID, m, config, sizes) {
+function describe(name, imageID, m, config, sizes, tagged = false) {
   const c = config.config || {};
   return {
     name,
     id: m.config.digest,
-    digest: imageID.slice(imageID.indexOf("@") + 1),
+    // a reference of docker tag has no repo digest: nothing was pulled by it
+    digest: tagged ? "" : imageID.slice(imageID.indexOf("@") + 1),
+    layerSizes: sizes,
     created: config.created || "0001-01-01T00:00:00Z",
     size: sizes.reduce((a, b) => a + b, 0),
     architecture: config.architecture || "",
@@ -306,6 +310,8 @@ function describe(name, imageID, m, config, sizes) {
     config: {
       User: c.User || "", ExposedPorts: c.ExposedPorts || null, Env: c.Env || null, Entrypoint: c.Entrypoint || null,
       Cmd: c.Cmd || null, WorkingDir: c.WorkingDir || "", Labels: c.Labels || null,
+      // VOLUME: docker run makes an anonymous volume for each (dockerapi)
+      Volumes: c.Volumes || null,
     },
   };
 }
@@ -336,7 +342,7 @@ async function listImages() {
     const blob = await c.match(new URL(`/tabernetes-blobs/${r.manifest.config.digest}`, self.location.href).href);
     if (!blob) continue;
     const config = await blob.json().catch(() => null);
-    if (config) out.push(describe(r.name, r.imageID, r.manifest, config, sizes));
+    if (config) out.push(describe(r.name, r.imageID, r.manifest, config, sizes, !!r.tagged));
   }
   return out;
 }
@@ -364,6 +370,37 @@ async function removeImage(name) {
   return deleted;
 }
 
+// tagImage gives the image of the reference source a second name, target,
+// for docker tag: the same manifest and config under a new reference, as
+// Docker's tag store does. The tag has no repo digest of its own (tagged),
+// since nothing was pulled by that name.
+async function tagImage(source, target) {
+  const c = await caches.open(CACHE);
+  const me = (await refs(c)).find((r) => r.name === source);
+  if (!me) throw new Error(`No such image: ${source}`);
+  const url = new URL(`/tabernetes-refs/${encodeURIComponent(target)}`, self.location.href).href;
+  await c.put(url, new Response(JSON.stringify({ imageID: me.imageID, manifest: me.manifest, tagged: true })));
+}
+
+// pruneLayers deletes the layers that no reference uses any more, for docker
+// image prune: what dockerd calls dangling images. A layer that a pod runs
+// with stays (store.remove). It returns the digests it deleted and their
+// size.
+async function pruneLayers() {
+  store ??= await openStore();
+  const c = await caches.open(CACHE);
+  const all = await refs(c);
+  const used = new Set(all.flatMap((r) => r.manifest.layers.map((l) => l.digest)));
+  const deleted = [];
+  let reclaimed = 0;
+  for (const digest of await store.digests()) {
+    if (used.has(digest)) continue;
+    const size = (await store.size(digest)) || 0;
+    if (await store.remove(digest)) { deleted.push(digest); reclaimed += size; }
+  }
+  return { deleted, reclaimed };
+}
+
 // pullOnly pulls an image without a VM, for docker pull: dockerd always asks
 // the registry, so a present image is checked against its tag.
 async function pullOnly(m) {
@@ -378,21 +415,36 @@ async function pullOnly(m) {
 }
 
 // containerSpec merges the image config with the container of the pod, as
-// the kubelet does: command replaces the entrypoint, args the cmd.
+// the kubelet does: command replaces the entrypoint, args the cmd. A Docker
+// container (the v86 shim) sends args as its command and, for docker run
+// --entrypoint, entrypoint: then dockerd drops the ENTRYPOINT and the CMD
+// of the image, also for an empty entrypoint (--entrypoint ""). user is
+// docker run -u, else the USER of the image.
 function containerSpec(img, c) {
-  const entrypoint = c.command?.length ? c.command : img.Entrypoint || [];
-  const cmd = c.command?.length ? c.args || [] : c.args?.length ? c.args : img.Cmd || [];
+  const docker = Array.isArray(c.entrypoint);
+  const entrypoint = docker ? c.entrypoint : c.command?.length ? c.command : img.Entrypoint || [];
+  const cmd = docker || c.command?.length ? c.args || [] : c.args?.length ? c.args : img.Cmd || [];
   const env = [...(img.Env || [])];
   for (const e of c.env || []) {
     const i = env.findIndex((x) => x.startsWith(e.split("=")[0] + "="));
     if (i >= 0) env[i] = e;
     else env.push(e);
   }
-  return { args: [...entrypoint, ...cmd], env, cwd: c.workingDir || img.WorkingDir || "/", user: img.User || "" };
+  return { args: [...entrypoint, ...cmd], env, cwd: c.workingDir || img.WorkingDir || "/", user: c.user || img.User || "" };
 }
 
 let emulator;
 const conns = new Map();
+
+// The volumes and bind mounts of the container (volumes.js), and their
+// sync: every SYNC_EVERY ms, before the exit is reported and when the page
+// stops the VM (vm.js asks with "sync"). At most 10 s, then the VM ends
+// anyway.
+let mounts = [];
+const syncMounts = () => Promise.race([
+  Promise.all(mounts.map((x) => x.sync())),
+  new Promise((r) => setTimeout(r, 10000)),
+]);
 
 // The lines that init writes to the second serial port (vm/init).
 let onControl = () => {};
@@ -558,11 +610,32 @@ async function start(m) {
     mem.set(key, e.data);
     tree.set(path, { uid: 0, gid: 0, mtime: now, mode: e.mode, size: e.data.length, key });
   }
+  // what docker cp put into the container (cpfs.js)
+  addFiles(tree, mem, m.files);
+  const configKey = "mem:0"; // .tabernetes/config.json, the first extra file
   for (const d of ["dev", "proc", "sys", "tmp"]) {
     if (!tree.files.has(d)) tree.set(d, { uid: 0, gid: 0, mtime: now, mode: modes.S_IFDIR | (d === "tmp" ? 0o1777 : 0o755) });
   }
+  addWorkingDir(tree, spec.cwd, now);
   const layers = new Map();
   for (const l of img.layers) layers.set(l.id, await store.layer(l.id));
+  // docker run -v and --mount: the mount points leave the tree, the
+  // volumes open (volumes.js); init makes the read-only ones read-only
+  const bindMem = new Map(), volumes = new Map();
+  let plan = [];
+  try {
+    plan = await prepareMounts(m.mounts, tree, bindMem);
+  } catch (e) {
+    vm.then((v) => v.emulator.destroy(), () => {});
+    post({ type: "exit", code: 128, message: `error mounting volumes: ${e?.message || e}` });
+    return;
+  }
+  for (const p of plan) if (p.vol) volumes.set(p.vol.name, p.vol);
+  if (plan.length) {
+    conf.readonly = readonlyPaths(plan);
+    mem.set(configKey, enc.encode(JSON.stringify(conf)));
+    tree.files.get(".tabernetes/config.json").size = mem.get(configKey).length;
+  }
   const fsJSON = tree.v86();
   img.layers = null;
 
@@ -588,14 +661,29 @@ async function start(m) {
   onControl = (l) => {
     if (l === "started") post({ type: "started", memory });
     else if (l.startsWith("error ")) error = l.slice(6);
-    else if (l.startsWith("exit ")) { flush(); post({ type: "exit", code: Number(l.slice(5)), message: error }); }
+    else if (l.startsWith("exit ")) {
+      flush();
+      // the files of the volumes are saved before the VM ends (vm.js
+      // stops it at the exit)
+      const code = Number(l.slice(5));
+      syncMounts().finally(() => post({ type: "exit", code, message: error }));
+    }
   };
   if (!emulator.is_running()) {
     // restored: it waits for the pod already
     emulator.add_listener("serial1-output-byte", control);
   }
-  emulator.fs9p.storage = new LayerStorage(layers, mem);
+  const storage = new LayerStorage(volumeReaders(memReaders(layers, bindMem), volumes), mem);
+  emulator.fs9p.storage = storage;
   emulator.fs9p.load_from_json(fsJSON);
+  try {
+    mounts = attachMounts(emulator.fs9p, plan, copyStorage(storage), post);
+  } catch (e) {
+    emulator.destroy();
+    post({ type: "exit", code: 128, message: `error mounting volumes: ${e?.message || e}` });
+    return;
+  }
+  if (mounts.length) setInterval(syncMounts, SYNC_EVERY);
   statRoot(emulator.fs9p, m.ephemeralStorage || (await imageFSCapacity()));
   emulator.run();
   // A restored VM has the clock and the random numbers of the saved one.
@@ -685,6 +773,49 @@ async function startRootfs(vm, m) {
   emulator.serial_send_bytes(1, new TextEncoder().encode(`go ${Date.now()} ${seed}\n`));
 }
 
+// pauseVM stops or runs the emulator and says when it is done.
+async function pauseVM(pause) {
+  try {
+    if (!emulator) throw new Error("the VM is not running");
+    if (pause) await emulator.stop();
+    else await emulator.run();
+    post({ type: pause ? "paused" : "resumed" });
+  } catch (e) {
+    post({ type: "pause-error", message: String(e?.message || e) });
+  }
+}
+
+// docker cp of a running container: the 9p tree of its VM (cpfs.js). The
+// answer is {type: "reply", seq, value} or {type: "reply", seq, error}.
+async function files(m) {
+  const fs = emulator?.fs9p;
+  if (!fs) throw new Error("the container is not running");
+  if (m.type === "statFile") return statFile(v86View(fs), m.path, m.follow);
+  if (m.type === "readFiles") return readFiles(v86View(fs), m.path, m.follow);
+  await writeFiles(fs, m.dir, m.entries);
+  return {};
+}
+
+// imageFiles is docker cp of a stopped container, in a worker without a
+// VM: its image, with the files of docker cp on top (m.files).
+async function imageFiles(m) {
+  const img = await pullImage(m.registry, m.image, "Never", () => {});
+  const tree = new Tree();
+  img.layers.forEach((l, i) => {
+    tree.layer = i;
+    tree.addLayer(l.id, l.entries);
+  });
+  tree.layer = img.layers.length;
+  const mem = new Map();
+  addFiles(tree, mem, m.files);
+  const layers = new Map();
+  for (const l of img.layers) layers.set(l.id, await store.layer(l.id));
+  const view = treeView(tree, new LayerStorage(layers, mem));
+  return m.stat ? statFile(view, m.path, m.follow) : readFiles(view, m.path, m.follow);
+}
+
+const transfers = (v) => (v?.entries || []).filter((e) => e.data).map((e) => e.data.buffer);
+
 function connect(id, port) {
   const net = emulator?.network_adapter;
   if (!net?.connect) { post({ type: "conn", id, event: "close" }); return; }
@@ -704,6 +835,20 @@ self.onmessage = ({ data: m }) => {
     case "pull": pullOnly(m); break;
     case "images": listImages().then((images) => post({ type: "images", images }), (e) => post({ type: "error", message: String(e?.message || e) })); break;
     case "rmi": removeImage(m.image).then((deleted) => post({ type: "removed", deleted }), (e) => post({ type: "error", message: String(e?.message || e) })); break;
+    case "tag": tagImage(m.source, m.target).then(() => post({ type: "tagged" }), (e) => post({ type: "error", message: String(e?.message || e) })); break;
+    case "prune": pruneLayers().then((r) => post({ type: "pruned", ...r }), (e) => post({ type: "error", message: String(e?.message || e) })); break;
+    // docker pause and unpause: the whole VM is the container, so stopping
+    // the emulator freezes all its processes, like the cgroup freezer
+    case "pause": pauseVM(true); break;
+    case "resume": pauseVM(false); break;
+    case "imageFiles": imageFiles(m).then((value) => post({ type: "files", value }, transfers(value)), (e) => post({ type: "error", message: String(e?.message || e) })); break;
+    case "statFile": case "readFiles": case "writeFiles":
+      files(m).then((value) => post({ type: "reply", seq: m.seq, value }, transfers(value)), (e) => post({ type: "reply", seq: m.seq, error: String(e?.message || e) }));
+      break;
+    // docker volume rm and prune: the data in OPFS (volumes.js)
+    case "volume-rm": removeVolume(m.name).then((size) => post({ type: "volume-removed", size }), (e) => post({ type: "error", message: String(e?.message || e) })); break;
+    // vm.js stops the VM: save the files of the volumes first
+    case "sync": syncMounts().finally(() => post({ type: "synced" })); break;
     case "connect": connect(m.id, m.port); break;
     case "write": conns.get(m.id)?.write(new Uint8Array(m.data)); break;
     case "close": conns.get(m.id)?.close(); conns.delete(m.id); break;

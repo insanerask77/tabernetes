@@ -369,6 +369,16 @@ class OPFSStore {
     return removeLayer(this.dir, fileName(digest));
   }
 
+  // digests lists the unpacked layers (docker image prune).
+  async digests() {
+    const out = [];
+    for await (const [name, h] of this.dir.entries()) {
+      const m = h.kind === "file" && name.match(/^([a-z0-9]+)-([a-f0-9]+)\.json$/);
+      if (m) out.push(`${m[1]}:${m[2]}`);
+    }
+    return out;
+  }
+
   // layer is the reader of the tar of an unpacked layer.
   async layer(digest) {
     const file = await (await this.dir.getFileHandle(fileName(digest) + ".tar")).getFile();
@@ -410,6 +420,10 @@ class MemoryStore {
 
   async remove(digest) {
     return this.tars.delete(digest) && this.indexes.delete(digest);
+  }
+
+  async digests() {
+    return [...this.indexes.keys()];
   }
 
   async layer(digest) {

@@ -139,3 +139,30 @@ test("a write after the end leaves zeros, not old bytes", async () => {
   f.writeAt(p, bytes(1, 8), 50);
   assert.deepEqual([...f.read(p).subarray(10, 50)], new Array(40).fill(0));
 });
+
+test("the data of containerd is saved at once, even while a log grows", async () => {
+  const st = store();
+  const fs = createFS({
+    persist: { keep: ["/var/log/v86", "/run/containerd"], skip: [], save: async (put, del) => applyHome(st, put, del) },
+  });
+  fs.mkdirSync("/var/log/v86");
+  fs.mkdirSync("/run/containerd");
+  const write = (path, s) => fs.writeFileSync(path, s);
+  write("/run/containerd/state.json", "{}");
+  // a log that writes every 20 ms would put a plain save off for 3 s
+  const t0 = Date.now();
+  let got = 0;
+  while (Date.now() - t0 < 200 && !got) {
+    write("/var/log/v86/c.log", String(Date.now()));
+    await sleep(20);
+    if (st.m.has("/run/containerd/state.json")) got = Date.now() - t0;
+  }
+  assert.ok(got > 0 && got < 150, `saved after ${got} ms`);
+  assert.equal(fs.saveStats.saves >= 1, true);
+
+  // flush saves what changed at once
+  write("/var/log/v86/d.log", "x");
+  fs.flush();
+  await sleep(0);
+  assert.ok(st.m.has("/var/log/v86/d.log"));
+});

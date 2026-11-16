@@ -1,7 +1,6 @@
 // The `docker` builtin. It is a thin HTTP client for the Docker Engine API
 // that startDocker serves on 127.0.0.1:2375 (dockerapi, vendored with
-// containerd in patch.go): run (attached, -it, -d, --rm, --name, -e, -p),
-// exec (-i, -t), logs and version here; port in dockerports.go; stop, kill
+// containerd in patch.go): run (its options in dockerrunflags.go), exec (-i, -t), logs and version here; port in dockerports.go; stop, kill
 // and rm in dockerstop.go; ps, inspect, create, start, restart, attach,
 // images, pull, rmi and the help in dockercmds.go. Attach and exec take over
 // the HTTP connection, as the docker CLI does.
@@ -21,6 +20,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"mvdan.cc/sh/v3/interp"
@@ -38,9 +38,21 @@ type dockerCreateRequest struct {
 	Tty       bool     `json:"Tty"`
 	OpenStdin bool     `json:"OpenStdin"`
 	StdinOnce bool     `json:"StdinOnce"`
+	// -w, -u, -h, --entrypoint ([""] for --entrypoint ""), -l,
+	// --stop-signal and --stop-timeout (dockerrunflags.go)
+	WorkingDir  string            `json:"WorkingDir,omitempty"`
+	User        string            `json:"User,omitempty"`
+	Hostname    string            `json:"Hostname,omitempty"`
+	Entrypoint  []string          `json:"Entrypoint,omitempty"`
+	Labels      map[string]string `json:"Labels,omitempty"`
+	StopSignal  string            `json:"StopSignal,omitempty"`
+	StopTimeout *int              `json:"StopTimeout,omitempty"`
 	// docker run -p (dockerports.go)
 	ExposedPorts map[string]struct{} `json:"ExposedPorts,omitempty"`
 	HostConfig   *dockerHostConfig   `json:"HostConfig,omitempty"`
+
+	// docker run -v /path: anonymous volumes (dockervolumes.go)
+	Volumes map[string]struct{} `json:"Volumes,omitempty"`
 }
 
 type dockerCreateResponse struct {
@@ -71,6 +83,10 @@ func dockerCall(ctx context.Context, method, path string, body any) ([]byte, int
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	// the tab that runs a container it starts (docker.go)
+	if s := sessionFrom(ctx); s != nil {
+		req.Header.Set(dockerTabHeader, s.name)
 	}
 	resp, err := localClient.Do(req)
 	if err != nil {
@@ -140,12 +156,21 @@ func dockerCmd(ctx context.Context, hc interp.HandlerContext, args []string, _ i
 func dockerRun(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	o, image, cmd, err := parseDockerRun(args)
 	if err != nil {
-		return fail(hc, 125, "docker: %v", err)
+		return fail(hc, 125, "docker: %v\n\nRun 'docker run --help' for more information", err)
+	}
+	if o.detachKeys != "" && !o.detach {
+		// dockerd refuses them at the attach; here before the VM boots
+		if _, err := parseDetachKeys(o.detachKeys); err != nil {
+			return fail(hc, 1, "docker: Error response from daemon: Invalid detach keys (%s) provided", o.detachKeys)
+		}
 	}
 	// docker run -dit keeps stdin open (for a later attach), but not only
-	// for the first attach.
-	req := dockerCreateRequest{Image: image, Cmd: cmd, Env: o.env, Tty: o.tty, OpenStdin: o.interactive, StdinOnce: o.interactive && !o.detach}
-	setHostConfig(&req, o)
+	// for the first attach (dockerRunRequest).
+	req, err := dockerRunRequest(hc, o, image, cmd)
+	if err != nil {
+		return fail(hc, 125, "docker: %v\n\nRun 'docker run --help' for more information", err)
+	}
+	setMounts(&req, o, hc.Dir)
 	// an image that is not there is pulled first (dockercmds.go)
 	id, err := dockerCreateContainer(ctx, hc, req, o.name, "run")
 	if err != nil {
@@ -165,16 +190,24 @@ func dockerRun(ctx context.Context, hc interp.HandlerContext, args []string) err
 	}
 
 	// The VM started the process already; the attach sends what it wrote
-	// so far too (logs=1), so nothing is missed.
-	q := "stream=1&stdout=1&stderr=1&logs=1"
-	if o.interactive {
-		q += "&stdin=1"
+	// so far too (logs=1), so nothing is missed. -a picks the streams.
+	q, stdin := dockerAttachQuery(o)
+	so := streamOptions{tty: o.tty, stdin: stdin, resizePath: "/containers/" + id + "/resize"}
+	if o.detachKeys != "" {
+		// the daemon checks the keys (dockerapi), the CLI watches for them
+		q += "&detachKeys=" + url.QueryEscape(o.detachKeys)
+		so.detachKeys, _ = parseDetachKeys(o.detachKeys)
 	}
-	detached, err := dockerStream(ctx, hc, "/containers/"+id+"/attach?"+q, nil, o.tty, o.interactive, "/containers/"+id+"/resize")
+	if !o.noSigProxy {
+		so.sigProxy = id
+	}
+	detached, err := dockerStreamWith(ctx, hc, "/containers/"+id+"/attach?"+q, nil, so)
 	if err != nil {
 		return fail(hc, 1, "docker: %v", err)
 	}
 	if detached {
+		// docker run says nothing when the user detaches
+		io.WriteString(termFrom(ctx), "\r\n")
 		return nil
 	}
 	body, status, err = dockerCall(ctx, http.MethodPost, "/containers/"+id+"/wait", nil)
@@ -187,84 +220,25 @@ func dockerRun(ctx context.Context, hc interp.HandlerContext, args []string) err
 	return exitCode(waited.StatusCode)
 }
 
-type dockerRunOptions struct {
-	interactive, tty, detach, rm bool
-	name                         string
-	env                          []string
-	publish                      []string // -p, as given
-}
-
-// parseDockerRun reads the options of docker run up to the image.
-func parseDockerRun(args []string) (o dockerRunOptions, image string, cmd []string, err error) {
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		value := func(name string) (string, error) {
-			if v, ok := strings.CutPrefix(a, name+"="); ok {
-				return v, nil
-			}
-			if i+1 >= len(args) {
-				return "", fmt.Errorf("flag needs an argument: %s", name)
-			}
-			i++
-			return args[i], nil
-		}
-		switch {
-		case a == "--":
-			if i+1 >= len(args) {
-				return o, "", nil, errors.New("\"docker run\" requires at least 1 argument")
-			}
-			return o, args[i+1], args[i+2:], nil
-		case !strings.HasPrefix(a, "-") || a == "-":
-			return o, a, args[i+1:], nil
-		case a == "--interactive":
-			o.interactive = true
-		case a == "--tty":
-			o.tty = true
-		case a == "--detach":
-			o.detach = true
-		case a == "--rm":
-			o.rm = true
-		case a == "--name" || strings.HasPrefix(a, "--name="):
-			if o.name, err = value("--name"); err != nil {
-				return
-			}
-		case a == "-e" || a == "--env" || strings.HasPrefix(a, "--env=") || strings.HasPrefix(a, "-e="):
-			name := "-e"
-			if strings.HasPrefix(a, "--env") {
-				name = "--env"
-			}
-			var v string
-			if v, err = value(name); err != nil {
-				return
-			}
-			o.env = append(o.env, v)
-		case a == "-p" || a == "--publish" || strings.HasPrefix(a, "-p") || strings.HasPrefix(a, "--publish="):
-			var v string
-			switch {
-			case a == "-p" || strings.HasPrefix(a, "-p="):
-				v, err = value("-p")
-			case strings.HasPrefix(a, "--publish"):
-				v, err = value("--publish")
-			default:
-				v = a[2:] // -p8080:80
-			}
-			if err != nil {
-				return
-			}
-			if _, err = parsePortSpec(v); err != nil {
-				return
-			}
-			o.publish = append(o.publish, v)
-		case len(a) > 1 && a[1] != '-' && strings.Trim(a[1:], "itd") == "":
-			// -i, -t, -d and their combinations: -it, -dit
-			o.interactive = o.interactive || strings.Contains(a, "i")
-			o.tty = o.tty || strings.Contains(a, "t")
-			o.detach = o.detach || strings.Contains(a, "d")
-		default:
-			return o, "", nil, fmt.Errorf("unknown flag: %s", a)
+// dockerAttachQuery is the query of the attach of docker run: stdout and
+// stderr, or the streams of -a, and stdin with -i. It reports whether stdin
+// is sent.
+func dockerAttachQuery(o dockerRunOptions) (string, bool) {
+	q := "stream=1&logs=1"
+	out := o.attach
+	if len(out) == 0 {
+		out = []string{"stdout", "stderr"}
+	}
+	for _, s := range []string{"stdout", "stderr"} {
+		if contains(out, s) {
+			q += "&" + s + "=1"
 		}
 	}
-	return o, "", nil, errors.New("\"docker run\" requires at least 1 argument")
+	stdin := o.interactive && (len(o.attach) == 0 || contains(o.attach, "stdin"))
+	if stdin {
+		q += "&stdin=1"
+	}
+	return q, stdin
 }
 
 // dockerExec runs a command in a running container: `docker exec [-i] [-t]
@@ -339,12 +313,34 @@ func dockerHijack(ctx context.Context, path string, body any) (net.Conn, *bufio.
 	return conn, br, resp.Header.Get("Content-Type"), nil
 }
 
-// dockerStream runs an attach or an exec: the output to the terminal (or
-// stdout and stderr), the input from the terminal or a pipe. With a tty and
-// the terminal as stdin, every key goes to the container, Ctrl-P Ctrl-Q
-// detaches, and resizePath gets the size of the terminal. It reports
-// whether the user detached.
+// streamOptions are the options of an attach or an exec stream.
+type streamOptions struct {
+	tty, stdin bool
+	resizePath string
+	// detachKeys end the stream with a tty and the terminal as stdin, as
+	// Docker's escape proxy does; nil: ctrl-p,ctrl-q.
+	detachKeys []byte
+	// sigProxy is the container whose main process gets SIGINT for Ctrl-C
+	// (docker attach and run --sig-proxy, the default without a tty).
+	sigProxy string
+}
+
+// defaultDetachKeys is Docker's detach sequence: ctrl-p, ctrl-q.
+var defaultDetachKeys = []byte{0x10, 0x11}
+
+// dockerStream runs an exec stream; see dockerStreamWith.
 func dockerStream(ctx context.Context, hc interp.HandlerContext, path string, body any, tty, stdin bool, resizePath string) (bool, error) {
+	return dockerStreamWith(ctx, hc, path, body, streamOptions{tty: tty, stdin: stdin, resizePath: resizePath})
+}
+
+// dockerStreamWith runs an attach or an exec: the output to the terminal
+// (or stdout and stderr), the input from the terminal or a pipe. With a tty
+// and the terminal as stdin, every key goes to the container, the detach
+// keys detach, and resizePath gets the size of the terminal. With sigProxy
+// and no tty, Ctrl-C sends SIGINT to the container instead of ending the
+// command, as the docker CLI forwards the signals it gets. It reports
+// whether the user detached.
+func dockerStreamWith(ctx context.Context, hc interp.HandlerContext, path string, body any, o streamOptions) (bool, error) {
 	conn, br, ct, err := dockerHijack(ctx, path, body)
 	if err != nil {
 		return false, err
@@ -352,12 +348,28 @@ func dockerStream(ctx context.Context, hc interp.HandlerContext, path string, bo
 	defer conn.Close()
 	t := termFrom(ctx)
 	fromTerm := fromTerminal(hc.Stdin)
+	tty, stdin := o.tty, o.stdin
+	// With sigProxy the terminal goes into line mode without stdin, to get
+	// Ctrl-C as a key: the stream must outlive it.
+	proxy := o.sigProxy != "" && !tty && fromTerm && t != nil
 	// On the terminal in raw or line mode, the shell holds back what is
 	// written to its stdout until the command ends: write to the terminal
 	// itself, as kubectl exec -i does (execLines).
 	var stdout, stderr io.Writer = hc.Stdout, hc.Stderr
 	if fromTerm && (tty || stdin) {
 		stdout, stderr = t, t
+	} else if proxy {
+		if toTerminal(stdout) {
+			stdout = t
+		}
+		if toTerminal(stderr) {
+			stderr = t
+		}
+	}
+	interrupt := func() {
+		// what the docker CLI does with the SIGINT of Ctrl-C
+		io.WriteString(t, "^C\r\n")
+		dockerCall(ctx, http.MethodPost, "/containers/"+o.sigProxy+"/kill?signal=INT", nil)
 	}
 
 	outDone := make(chan struct{})
@@ -383,7 +395,7 @@ func dockerStream(ctx context.Context, hc interp.HandlerContext, path string, bo
 	}()
 	resize := func() {
 		cols, rows := t.size()
-		dockerCall(ctx, http.MethodPost, fmt.Sprintf("%s?h=%d&w=%d", resizePath, rows, cols), nil)
+		dockerCall(ctx, http.MethodPost, fmt.Sprintf("%s?h=%d&w=%d", o.resizePath, rows, cols), nil)
 	}
 	closeWrite := func() {
 		if cw, ok := conn.(interface{ CloseWrite() error }); ok {
@@ -396,6 +408,22 @@ func dockerStream(ctx context.Context, hc interp.HandlerContext, path string, bo
 		if tty && fromTerm {
 			resize()
 		}
+		if proxy {
+			leave := t.enterLine()
+			defer leave()
+			for {
+				select {
+				case <-outDone:
+					return false, nil
+				case <-ctx.Done():
+					return false, nil
+				case s := <-t.keys:
+					if strings.ContainsRune(s, 0x03) {
+						interrupt()
+					}
+				}
+			}
+		}
 	case !fromTerm:
 		// a pipe: send it, then end stdin
 		go func() {
@@ -406,7 +434,10 @@ func dockerStream(ctx context.Context, hc interp.HandlerContext, path string, bo
 		leave := t.enterLine()
 		defer leave()
 		resize()
-		ctrlP := false
+		esc := &escapeKeys{keys: o.detachKeys}
+		if esc.keys == nil {
+			esc.keys = defaultDetachKeys
+		}
 		for {
 			select {
 			case <-outDone:
@@ -418,34 +449,25 @@ func dockerStream(ctx context.Context, hc interp.HandlerContext, path string, bo
 					resize()
 					continue
 				}
-				// Ctrl-P Ctrl-Q detaches, as in Docker; a single Ctrl-P is
-				// sent on with the next key.
-				var out []byte
-				for _, c := range []byte(s) {
-					switch {
-					case ctrlP && c == 0x11:
-						io.WriteString(t, "\r\nread escape sequence\r\n")
-						return true, nil
-					case ctrlP:
-						out = append(out, 0x10, c)
-						ctrlP = false
-					case c == 0x10:
-						ctrlP = true
-					default:
-						out = append(out, c)
-					}
-				}
+				out, detach := esc.feed([]byte(s))
 				if len(out) > 0 {
 					if _, err := conn.Write(out); err != nil {
 						return false, nil
 					}
+				}
+				if detach {
+					return true, nil
 				}
 			}
 		}
 	default:
 		// -i without -t from the terminal: the terminal edits lines and
 		// echoes, the container gets whole lines; Ctrl-D ends stdin.
-		return false, dockerLines(ctx, t, conn, closeWrite, outDone)
+		var onCtrlC func()
+		if o.sigProxy != "" {
+			onCtrlC = interrupt
+		}
+		return false, dockerLines(ctx, t, conn, closeWrite, outDone, onCtrlC)
 	}
 	select {
 	case <-outDone:
@@ -454,9 +476,42 @@ func dockerStream(ctx context.Context, hc interp.HandlerContext, path string, bo
 	return false, nil
 }
 
+// escapeKeys finds the detach sequence in the keys typed, like the escape
+// proxy of moby/term: the keys of a sequence that has begun are held back,
+// and sent on if the sequence breaks off.
+type escapeKeys struct {
+	keys []byte
+	pos  int // keys of the sequence seen so far
+}
+
+// feed returns what goes to the container, and whether the whole sequence
+// was typed.
+func (e *escapeKeys) feed(b []byte) (out []byte, detach bool) {
+	for _, c := range b {
+		if c == e.keys[e.pos] {
+			e.pos++
+			if e.pos == len(e.keys) {
+				return out, true
+			}
+			continue
+		}
+		if e.pos > 0 {
+			out = append(out, e.keys[:e.pos]...)
+			e.pos = 0
+			if c == e.keys[0] {
+				e.pos = 1
+				continue
+			}
+		}
+		out = append(out, c)
+	}
+	return out, false
+}
+
 // dockerLines sends lines edited on the terminal to w, like kubectl exec -i
-// (execLines), until the output ends.
-func dockerLines(ctx context.Context, t *terminal, w io.Writer, closeWrite func(), outDone <-chan struct{}) error {
+// (execLines), until the output ends. Ctrl-C calls onCtrlC (docker attach:
+// SIGINT to the container); without it, Ctrl-C ends stdin.
+func dockerLines(ctx context.Context, t *terminal, w io.Writer, closeWrite func(), outDone <-chan struct{}, onCtrlC func()) error {
 	leave := t.enterLine()
 	defer leave()
 	var line []rune
@@ -470,6 +525,9 @@ func dockerLines(ctx context.Context, t *terminal, w io.Writer, closeWrite func(
 		case s := <-t.keys:
 			for _, k := range parseKeys(s) {
 				switch {
+				case k.name == "ctrl-c" && onCtrlC != nil:
+					onCtrlC()
+					line = nil // what a terminal in line mode does
 				case closed:
 				case k.name == "ctrl-d" && len(line) == 0:
 					io.WriteString(t, "\r\n")
@@ -495,48 +553,6 @@ func dockerLines(ctx context.Context, t *terminal, w io.Writer, closeWrite func(
 			}
 		}
 	}
-}
-
-// dockerLogs prints the console of a container: `docker logs CONTAINER`.
-// Without a tty the API multiplexes the streams: every frame starts with 8
-// bytes, the stream (1 stdout, 2 stderr) and the size.
-func dockerLogs(ctx context.Context, hc interp.HandlerContext, args []string) error {
-	if len(args) != 1 {
-		return fail(hc, 1, "docker: \"logs\" requires exactly one container")
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, dockerAPIBase+"/containers/"+args[0]+"/logs?stdout=1&stderr=1", nil)
-	if err != nil {
-		return fail(hc, 1, "docker: %v", err)
-	}
-	resp, err := localClient.Do(req)
-	if err != nil {
-		return fail(hc, 1, "docker: %v", err)
-	}
-	defer resp.Body.Close()
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fail(hc, 1, "docker: %v", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fail(hc, 1, "docker: %s", dockerErr(b, resp.StatusCode))
-	}
-	if resp.Header.Get("Content-Type") != "application/vnd.docker.multiplexed-stream" {
-		hc.Stdout.Write(b)
-		return nil
-	}
-	for len(b) >= 8 {
-		n := int(binary.BigEndian.Uint32(b[4:8]))
-		if n > len(b)-8 {
-			n = len(b) - 8
-		}
-		out := hc.Stdout
-		if b[0] == 2 {
-			out = hc.Stderr
-		}
-		out.Write(b[8 : 8+n])
-		b = b[8+n:]
-	}
-	return nil
 }
 
 // dockerVersionCmd prints the version of the API server: `docker version`.

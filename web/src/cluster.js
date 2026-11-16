@@ -370,6 +370,7 @@ self.onconnect = (e) => {
         // The tab holds this lock while it is open.
         navigator.locks.request(data.lock, () => {
           tabs.delete(id);
+          globalThis.fs?.flush?.();
           if (forgotten && !tabs.size) { self.close(); return; }
           // Its node, and the docker nodes that no other tab is connected to.
           for (const name of port.nodes) globalThis.tabernetes?.dropNode(name);
@@ -405,6 +406,10 @@ self.onconnect = (e) => {
         else ctl.enqueue(new Uint8Array(data.data));
         break;
       }
+      case "flush":
+        // the tab goes away or out of sight: save the changed files now
+        globalThis.fs?.flush?.();
+        break;
       case "session":
         // the port of the session of the tab (bridge.js), before joinTab
         port.session = data.port;

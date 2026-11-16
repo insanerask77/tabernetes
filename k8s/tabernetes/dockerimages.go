@@ -116,3 +116,35 @@ func (s dockerImageStore) Remove(ctx context.Context, name string) ([]string, er
 	}
 	return deleted, nil
 }
+
+// Tag gives the image of the reference source the name target too, for
+// docker tag (dockerapi.ImageTagger).
+func (s dockerImageStore) Tag(ctx context.Context, source, target string) error {
+	vm, err := s.vm()
+	if err != nil {
+		return err
+	}
+	_, err = await(ctx, vm.Call("tagImage", source, target))
+	return err
+}
+
+// PruneLayers deletes the layers that no reference uses, for docker image
+// prune (dockerapi.LayerPruner).
+func (s dockerImageStore) PruneLayers(ctx context.Context) ([]string, int64, error) {
+	vm, err := s.vm()
+	if err != nil {
+		return nil, 0, err
+	}
+	v, err := await(ctx, vm.Call("pruneLayers"))
+	if err != nil {
+		return nil, 0, err
+	}
+	var res struct {
+		Deleted   []string `json:"deleted"`
+		Reclaimed int64    `json:"reclaimed"`
+	}
+	if err := json.Unmarshal([]byte(v.String()), &res); err != nil {
+		return nil, 0, err
+	}
+	return res.Deleted, res.Reclaimed, nil
+}

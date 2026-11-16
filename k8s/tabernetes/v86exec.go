@@ -61,6 +61,12 @@ func (v *v86VM) stream(ctx context.Context, attach bool, cmd []string, in io.Rea
 // protocol of init: dial connects to a port of the VM. Docker containers use
 // it too (docker.go).
 func streamVM(ctx context.Context, dial func(int32) (net.Conn, error), attach bool, cmd []string, in io.Reader, out, errOut io.Writer, tty bool, resize <-chan remotecommand.TerminalSize) error {
+	return streamVMWith(ctx, dial, attach, cmd, in, out, errOut, tty, resize, nil)
+}
+
+// streamVMWith is streamVM with more fields for the request to init, such
+// as "detachable" for docker attach.
+func streamVMWith(ctx context.Context, dial func(int32) (net.Conn, error), attach bool, cmd []string, in io.Reader, out, errOut io.Writer, tty bool, resize <-chan remotecommand.TerminalSize, extra map[string]any) error {
 	conn, err := dial(vmExecPort)
 	if err != nil {
 		return fmt.Errorf("failed to connect to the container: %w", err)
@@ -74,6 +80,9 @@ func streamVM(ctx context.Context, dial func(int32) (net.Conn, error), attach bo
 	}()
 
 	req := map[string]any{"cmd": cmd, "tty": tty, "stdin": in != nil, "attach": attach}
+	for k, v := range extra {
+		req[k] = v
+	}
 	if tty && resize != nil {
 		// kubectl sends the size of its terminal right away
 		select {

@@ -90,6 +90,12 @@ export async function connectCluster(url, tries = 0) {
   };
   port.start();
   port.postMessage({ type: "hello", id, lock });
+  // The files of the cluster (fs.js) are saved a moment after they change.
+  // A tab that goes away or out of sight asks the worker to save them now:
+  // a reload right after docker run keeps the container.
+  const flush = () => port.postMessage({ type: "flush" });
+  addEventListener("pagehide", flush);
+  addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") flush(); });
   const h = await greeted;
   // A control plane that failed, exited or goes down (poweroff): its worker
   // closes in a moment (cluster.js), and the next one boots a new cluster.

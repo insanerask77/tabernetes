@@ -89,6 +89,8 @@ type tabPod struct {
 	ctx             context.Context
 	cancel          context.CancelFunc
 
+	emptyDirs []tabMount // the emptyDir volumes that the container mounts (tabvolumes.go)
+
 	mu      sync.Mutex
 	w       workload
 	status  corev1.ContainerStatus
@@ -134,12 +136,17 @@ func (n *tabNode) newPod(pod *corev1.Pod) *tabPod {
 	if len(pod.Spec.Containers) != 1 || len(pod.Spec.InitContainers) > 0 {
 		tp.phase, tp.reason, tp.message = corev1.PodFailed, "UnsupportedPod", "the tab node runs pods with exactly one container and no init containers"
 	}
+	emptyDir := map[string]bool{}
 	for _, v := range pod.Spec.Volumes {
+		switch {
+		case v.EmptyDir != nil:
+			emptyDir[v.Name] = true
 		// every pod has the one of its service account token
-		if !strings.HasPrefix(v.Name, "kube-api-access-") {
+		case !strings.HasPrefix(v.Name, "kube-api-access-"):
 			tp.ignored = append(tp.ignored, "volume "+v.Name)
 		}
 	}
+	tp.emptyDirs = emptyDirMounts(pod.UID, tp.container.VolumeMounts, emptyDir, &tp.ignored)
 	if len(tp.container.EnvFrom) > 0 {
 		tp.ignored = append(tp.ignored, "envFrom")
 	}
@@ -194,7 +201,7 @@ func (tp *tabPod) run() {
 		return
 	}
 	if len(tp.ignored) > 0 {
-		tp.event(corev1.EventTypeWarning, "Unsupported", "the tab node has no volumes, and of valueFrom only the fields of the pod; the container starts without: "+strings.Join(tp.ignored, ", "))
+		tp.event(corev1.EventTypeWarning, "Unsupported", "the tab node has only emptyDir volumes, and of valueFrom only the fields of the pod; the container starts without: "+strings.Join(tp.ignored, ", "))
 	}
 	backoff := backoffStart
 	for ctx.Err() == nil {
@@ -420,6 +427,8 @@ func (tp *tabPod) terminate(grace time.Duration) (first bool) {
 	tp.termOnce.Do(func() {
 		first = true
 		tp.kill(max(grace, minimumGracePeriod))
+		// the emptyDir volumes go with the pod, as on a kubelet
+		go tp.removeEmptyDirs()
 	})
 	return first
 }

@@ -13,14 +13,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
-	"text/tabwriter"
 	"text/template"
 	"time"
 
@@ -56,6 +54,15 @@ type dockerFlagValues map[string]string
 
 func (f dockerFlagValues) bool(name string) bool { return f[name] == "true" }
 
+// list returns the values of a flag that may be given more than once
+// (--filter).
+func (f dockerFlagValues) list(name string) []string {
+	if v, ok := f[name]; ok {
+		return strings.Split(v, "\x00")
+	}
+	return nil
+}
+
 const (
 	formatHelp = `Format output using a custom template:
 'table':            Print output in table format with column headers (default)
@@ -76,11 +83,13 @@ var (
 		aliases: []string{"docker container ls", "docker container list", "docker container ps", "docker ps"},
 		flags: []flagSpec{
 			{'a', "all", "", "Show all containers (default shows just running)"},
+			{'f', "filter", "filter", "Filter output based on conditions provided"},
 			{0, "format", "string", formatHelp},
 			{'n', "last", "int", "Show n last created containers (includes all states) (default -1)"},
 			{'l', "latest", "", "Show the latest created container (includes all states)"},
 			{0, "no-trunc", "", "Don't truncate output"},
 			{'q', "quiet", "", "Only display container IDs"},
+			{'s', "size", "", "Display total file sizes"},
 		},
 		maxArgs: 0, run: dockerPS,
 	}
@@ -128,17 +137,18 @@ var dockerTopCommands = []string{"run", "exec", "ps", "pull", "images", "version
 func init() {
 	for _, c := range []*dockerCommand{
 		{name: "run", use: "run [OPTIONS] IMAGE [COMMAND] [ARG...]", short: "Create and run a new container from an image",
-			aliases: []string{"docker container run", "docker run"}, raw: dockerRun},
+			aliases: []string{"docker container run", "docker run"}, flags: dockerRunFlags, raw: dockerRun},
 		{name: "exec", use: "exec [OPTIONS] CONTAINER COMMAND [ARG...]", short: "Execute a command in a running container",
 			aliases: []string{"docker container exec", "docker exec"}, raw: dockerExec},
 		psCommand, imagesCommand, pullCommand, rmiCommand,
 		{name: "version", use: "version [OPTIONS]", short: "Show the Docker version information", raw: dockerVersionCmd},
 		{name: "create", use: "create [OPTIONS] IMAGE [COMMAND] [ARG...]", short: "Create a new container",
-			aliases: []string{"docker container create", "docker create"}, raw: dockerCreate},
+			aliases: []string{"docker container create", "docker create"}, flags: dockerCreateFlags, raw: dockerCreate},
 		{name: "start", use: "start [OPTIONS] CONTAINER [CONTAINER...]", short: "Start one or more stopped containers",
 			aliases: []string{"docker container start", "docker start"},
 			flags: []flagSpec{
 				{'a', "attach", "", "Attach STDOUT/STDERR and forward signals"},
+				{0, "detach-keys", "string", "Override the key sequence for detaching a container"},
 				{'i', "interactive", "", "Attach container's STDIN"},
 			},
 			minArgs: 1, maxArgs: -1, run: dockerStart},
@@ -148,7 +158,11 @@ func init() {
 			minArgs: 1, maxArgs: -1, run: dockerRestart},
 		{name: "attach", use: "attach [OPTIONS] CONTAINER", short: "Attach local standard input, output, and error streams to a running container",
 			aliases: []string{"docker container attach", "docker attach"},
-			flags:   []flagSpec{{0, "no-stdin", "", "Do not attach STDIN"}},
+			flags: []flagSpec{
+				{0, "detach-keys", "string", "Override the key sequence for detaching a container"},
+				{0, "no-stdin", "", "Do not attach STDIN"},
+				{0, "sig-proxy", "", "Proxy all received signals to the process (default true)"},
+			},
 			minArgs: 1, maxArgs: 1, run: dockerAttach},
 		{name: "inspect", use: "inspect [OPTIONS] NAME|ID [NAME|ID...]", short: "Return low-level information on Docker objects",
 			flags: []flagSpec{
@@ -211,7 +225,12 @@ func dockerUsage() string {
 		fmt.Fprintf(&b, "  %-12s%s\n", n, dockerCommands[n].short)
 	}
 	b.WriteString("\nManagement Commands:\n")
-	for _, n := range []string{"container", "image"} {
+	var mgmt []string
+	for n := range dockerManagement {
+		mgmt = append(mgmt, n)
+	}
+	sort.Strings(mgmt)
+	for _, n := range mgmt {
 		fmt.Fprintf(&b, "  %-12s%s\n", n, dockerManagement[n].short)
 	}
 	b.WriteString("\nCommands:\n")
@@ -311,12 +330,21 @@ func parseDockerFlags(c *dockerCommand, args []string) (dockerFlagValues, []stri
 		}
 	}
 	set := func(s flagSpec, v string, name string) error {
+		flag := "--" + s.long
+		if s.short != 0 {
+			flag = "-" + string(s.short) + ", " + flag
+		}
+		if s.arg == "filter" {
+			// opts.FilterOpt: key=value, and the flag adds up
+			if !strings.Contains(v, "=") {
+				return fmt.Errorf("invalid argument %q for %q flag: bad format of filter (expected name=value)", v, flag)
+			}
+			if old, ok := f[s.long]; ok {
+				v = old + "\x00" + v
+			}
+		}
 		if s.arg == "int" {
 			if _, err := strconv.Atoi(v); err != nil {
-				flag := "--" + s.long
-				if s.short != 0 {
-					flag = "-" + string(s.short) + ", " + flag
-				}
 				return fmt.Errorf("invalid argument %q for %q flag: strconv.ParseInt: parsing %q: invalid syntax", v, flag, v)
 			}
 		}
@@ -445,257 +473,62 @@ func dockerGet(ctx context.Context, path string, v any) (int, error) {
 
 // ---- ps ----
 
-// psContainer is an entry of GET /containers/json.
-type psContainer struct {
-	ID      string `json:"Id"`
-	Names   []string
-	Image   string
-	ImageID string
-	Command string
-	Created int64
-	Ports   []psPort
-	State   string
-	Status  string
-}
-
-type psPort struct {
-	IP          string `json:"IP,omitempty"`
-	PrivatePort uint16
-	PublicPort  uint16 `json:",omitempty"`
-	Type        string
-}
-
-// psRow is a line of docker ps, the fields its templates know.
-type psRow struct {
-	ID, Image, Command, CreatedAt, RunningFor, Ports, State, Status, Names string
-}
-
-var psHeader = psRow{ID: "CONTAINER ID", Image: "IMAGE", Command: "COMMAND", CreatedAt: "CREATED AT", RunningFor: "CREATED",
-	Ports: "PORTS", State: "STATE", Status: "STATUS", Names: "NAMES"}
-
-const psTable = "table {{.ID}}\t{{.Image}}\t{{.Command}}\t{{.RunningFor}}\t{{.Status}}\t{{.Ports}}\t{{.Names}}"
-
-func psRowOf(c psContainer, trunc bool, now time.Time) psRow {
-	r := psRow{
-		ID: c.ID, Image: c.Image, Command: c.Command,
-		CreatedAt:  time.Unix(c.Created, 0).String(),
-		RunningFor: units.HumanDuration(now.Sub(time.Unix(c.Created, 0))) + " ago",
-		Ports:      displayablePorts(c.Ports), State: c.State, Status: c.Status,
-	}
-	if trunc {
-		r.ID = truncateID(c.ID)
-		r.Command = ellipsis(c.Command, 20)
-		if r.Image == "" {
-			r.Image = "<no image>"
-		}
-	}
-	r.Command = strconv.Quote(r.Command)
-	var names []string
-	for _, n := range c.Names {
-		names = append(names, strings.TrimPrefix(n, "/"))
-	}
-	r.Names = strings.Join(names, ",")
-	return r
-}
-
 // dockerPS lists the containers: `docker ps`.
 func dockerPS(ctx context.Context, hc interp.HandlerContext, f dockerFlagValues, _ []string) error {
+	o := psOptions{format: f["format"], quiet: f.bool("quiet"), size: f.bool("size")}
+	_, o.sizeChanged = f["size"]
+	if o.format != "" && o.quiet {
+		fmt.Fprintln(hc.Stderr, "WARNING: Ignoring custom format, because both --format and --quiet are set.")
+	}
+	if err := o.prepare(); err != nil {
+		return fail(hc, 1, "%v", err)
+	}
 	q := url.Values{}
 	if f.bool("all") {
 		q.Set("all", "1")
 	}
-	if n, _ := strconv.Atoi(f["last"]); n > 0 {
-		q.Set("limit", strconv.Itoa(n))
+	last := -1
+	if v, ok := f["last"]; ok {
+		last, _ = strconv.Atoi(v)
 	}
-	if f.bool("latest") {
-		q.Set("limit", "1")
+	if f.bool("latest") && last == -1 {
+		last = 1
+	}
+	if last > 0 {
+		q.Set("limit", strconv.Itoa(last))
+	}
+	if o.size {
+		q.Set("size", "1")
+	}
+	if filters := f.list("filter"); len(filters) > 0 {
+		q.Set("filters", filterJSON(filters))
 	}
 	var cs []psContainer
 	if _, err := dockerGet(ctx, "/containers/json?"+q.Encode(), &cs); err != nil {
 		return fail(hc, 1, "%v", err)
 	}
-	format := f["format"]
-	switch {
-	case f.bool("quiet"):
-		format = "{{.ID}}"
-	case format == "":
-		format = psTable
+	var out bytes.Buffer
+	if err := writePS(&out, o, cs, !f.bool("no-trunc"), time.Now()); err != nil {
+		return fail(hc, 1, "%v", err)
 	}
-	now := time.Now()
-	rows := make([]any, len(cs))
-	for i, c := range cs {
-		rows[i] = psRowOf(c, !f.bool("no-trunc"), now)
-	}
-	return writeFormatted(hc, format, psHeader, rows)
-}
-
-// writeFormatted writes rows with a template of the docker CLI: "table
-// TEMPLATE" (columns with a header made of header), "json" or a template.
-func writeFormatted(hc interp.HandlerContext, format string, header any, rows []any) error {
-	if err := writeFormattedTo(hc.Stdout, format, header, rows); err != nil {
-		code := 1
-		if strings.HasPrefix(err.Error(), "template parsing error") {
-			code = 64
-		}
-		return fail(hc, code, "%v", err)
-	}
+	hc.Stdout.Write(out.Bytes())
 	return nil
 }
 
-func writeFormattedTo(w io.Writer, format string, header any, rows []any) error {
-	table := false
-	switch {
-	case format == "table":
-		return errors.New("table needs a template")
-	case strings.HasPrefix(format, "table "):
-		table, format = true, format[6:]
-	case format == "json":
-		format = "{{json .}}"
+// filterJSON is the ?filters= of the --filter values "key=value", as the
+// docker CLI sends it.
+func filterJSON(filters []string) string {
+	m := map[string]map[string]bool{}
+	for _, kv := range filters {
+		k, v, _ := strings.Cut(kv, "=")
+		k = strings.ToLower(strings.TrimSpace(k))
+		if m[k] == nil {
+			m[k] = map[string]bool{}
+		}
+		m[k][strings.TrimSpace(v)] = true
 	}
-	format = strings.NewReplacer(`\t`, "\t", `\n`, "\n").Replace(format)
-	tmpl, err := template.New("").Funcs(templateFuncs).Parse(format)
-	if err != nil {
-		return fmt.Errorf("template parsing error: %w", err)
-	}
-	var buf bytes.Buffer
-	var out io.Writer = &buf
-	var tw *tabwriter.Writer
-	if table {
-		// the settings of the docker CLI (formatter.Context)
-		tw = tabwriter.NewWriter(&buf, 10, 1, 3, ' ', 0)
-		out = tw
-		if err := tmpl.Execute(out, header); err != nil {
-			return err
-		}
-		io.WriteString(out, "\n")
-	}
-	for _, r := range rows {
-		if err := tmpl.Execute(out, r); err != nil {
-			return err
-		}
-		io.WriteString(out, "\n")
-	}
-	if tw != nil {
-		tw.Flush()
-	}
-	_, err = w.Write(buf.Bytes())
-	return err
-}
-
-// templateFuncs are the functions of the templates of the docker CLI.
-var templateFuncs = template.FuncMap{
-	"json": func(v any) string {
-		var b bytes.Buffer
-		enc := json.NewEncoder(&b)
-		enc.SetEscapeHTML(false)
-		if err := enc.Encode(v); err != nil {
-			panic(err)
-		}
-		return strings.TrimSpace(b.String())
-	},
-	"split": strings.Split,
-	"join":  strings.Join,
-	"title": func(s string) string {
-		if s == "" {
-			return s
-		}
-		return strings.ToUpper(s[:1]) + s[1:]
-	},
-	"lower": strings.ToLower,
-	"upper": strings.ToUpper,
-	"pad": func(s string, l, r int) string {
-		return strings.Repeat(" ", l) + s + strings.Repeat(" ", r)
-	},
-	"truncate": func(s string, n int) string {
-		if len(s) > n {
-			return s[:n]
-		}
-		return s
-	},
-	"println": fmt.Sprintln,
-}
-
-// truncateID is an id as Docker shows it: 12 hex digits, no "sha256:".
-func truncateID(id string) string {
-	if i := strings.IndexByte(id, ':'); i >= 0 {
-		id = id[i+1:]
-	}
-	if len(id) > 12 {
-		id = id[:12]
-	}
-	return id
-}
-
-// ellipsis shortens s to n runes, the last one "…" (formatter.Ellipsis).
-func ellipsis(s string, n int) string {
-	rs := []rune(s)
-	if len(rs) <= n {
-		return s
-	}
-	return string(rs[:n-1]) + "…"
-}
-
-// displayablePorts is the PORTS column (formatter.DisplayablePorts): the
-// ports sorted, consecutive ones as a range, published ones as
-// 0.0.0.0:8080->80/tcp.
-func displayablePorts(ports []psPort) string {
-	type group struct{ first, last uint16 }
-	groups := map[string]*group{}
-	var keys, result, mappings []string
-	ps := append([]psPort(nil), ports...)
-	sort.Slice(ps, func(i, j int) bool {
-		a, b := ps[i], ps[j]
-		if a.PrivatePort != b.PrivatePort {
-			return a.PrivatePort < b.PrivatePort
-		}
-		if a.IP != b.IP {
-			return a.IP < b.IP
-		}
-		if a.PublicPort != b.PublicPort {
-			return a.PublicPort < b.PublicPort
-		}
-		return a.Type < b.Type
-	})
-	form := func(key string, g *group) string {
-		ip, typ, ok := strings.Cut(key, "/")
-		if !ok {
-			ip, typ = "", key
-		}
-		s := strconv.Itoa(int(g.first))
-		if g.first != g.last {
-			s = fmt.Sprintf("%s-%d", s, g.last)
-		}
-		if ip != "" {
-			s = fmt.Sprintf("%s->%s", net.JoinHostPort(ip, s), s)
-		}
-		return s + "/" + typ
-	}
-	for _, p := range ps {
-		key := p.Type
-		if p.IP != "" {
-			if p.PublicPort != p.PrivatePort {
-				mappings = append(mappings, fmt.Sprintf("%s->%d/%s", net.JoinHostPort(p.IP, strconv.Itoa(int(p.PublicPort))), p.PrivatePort, p.Type))
-				continue
-			}
-			key = p.IP + "/" + p.Type
-		}
-		g := groups[key]
-		if g == nil {
-			groups[key] = &group{p.PrivatePort, p.PrivatePort}
-			keys = append(keys, key)
-			continue
-		}
-		if p.PrivatePort == g.last+1 {
-			g.last = p.PrivatePort
-			continue
-		}
-		result = append(result, form(key, g))
-		groups[key] = &group{p.PrivatePort, p.PrivatePort}
-	}
-	for _, k := range keys {
-		result = append(result, form(k, groups[k]))
-	}
-	return strings.Join(append(result, mappings...), ", ")
+	b, _ := json.Marshal(m)
+	return string(b)
 }
 
 // ---- inspect ----
@@ -705,16 +538,14 @@ func displayablePorts(ports []psPort) string {
 func dockerInspectOf(kind string) func(ctx context.Context, hc interp.HandlerContext, f dockerFlagValues, args []string) error {
 	return func(ctx context.Context, hc interp.HandlerContext, f dockerFlagValues, args []string) error {
 		if t := f["type"]; t != "" {
-			if t != "container" && t != "image" {
-				return fail(hc, 1, "unknown type: %q: must be one of \"container\", \"image\"", t)
+			if t != "container" && t != "image" && t != "volume" {
+				return fail(hc, 1, "unknown type: %q: must be one of \"container\", \"image\", \"volume\"", t)
 			}
 			kind = t
 		}
 		var tmpl *template.Template
-		if format := f["format"]; format != "" {
-			if format == "json" {
-				format = "{{json .}}"
-			}
+		compact := f["format"] == "json"
+		if format := f["format"]; format != "" && !compact {
 			var err error
 			if tmpl, err = template.New("").Funcs(templateFuncs).Parse(format); err != nil {
 				return fail(hc, 64, "template parsing error: %v", err)
@@ -732,12 +563,17 @@ func dockerInspectOf(kind string) func(ctx context.Context, hc interp.HandlerCon
 		}
 		var out bytes.Buffer
 		if tmpl == nil {
-			// the layout of the docker CLI: an indented JSON array
+			// the layout of the docker CLI: an indented JSON array, or with
+			// --format json a compact one on one line (NewJSONInspector)
 			b, _ := json.Marshal(raws)
 			if len(raws) == 0 {
 				b = []byte("[]")
 			}
-			json.Indent(&out, b, "", "    ")
+			if compact {
+				json.Compact(&out, b)
+			} else {
+				json.Indent(&out, b, "", "    ")
+			}
 			out.WriteString("\n")
 		} else {
 			for _, raw := range raws {
@@ -771,6 +607,10 @@ func inspectObject(ctx context.Context, kind, ref string) (json.RawMessage, erro
 		}
 		return json.RawMessage(bytes.TrimSpace(body)), status, nil
 	}
+	if kind == "volume" {
+		raw, _, err := try("/volumes/" + url.PathEscape(ref))
+		return raw, err
+	}
 	if kind != "image" {
 		raw, status, err := try("/containers/" + url.PathEscape(ref) + "/json")
 		if err == nil || kind == "container" {
@@ -782,6 +622,10 @@ func inspectObject(ctx context.Context, kind, ref string) (json.RawMessage, erro
 	}
 	raw, status, err := try("/images/" + imagePath(ref) + "/json")
 	if err != nil && kind == "" && status == http.StatusNotFound {
+		// docker inspect tries a volume after an image
+		if raw, _, err := try("/volumes/" + url.PathEscape(ref)); err == nil {
+			return raw, nil
+		}
 		return nil, fmt.Errorf("Error: No such object: %s", ref)
 	}
 	return raw, err
@@ -804,7 +648,7 @@ type dockerInspectState struct {
 	ID    string `json:"Id"`
 	Name  string
 	State struct {
-		Running bool
+		Running, Paused bool
 	}
 	Config struct {
 		Tty       bool
@@ -860,13 +704,16 @@ func dockerCreateContainer(ctx context.Context, hc interp.HandlerContext, req do
 func dockerCreate(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	o, image, cmd, err := parseDockerRun(args)
 	if err != nil {
-		return fail(hc, 125, "docker: %v", err)
+		return fail(hc, 125, "docker: %v\n\nRun 'docker create --help' for more information", err)
 	}
 	if o.detach {
 		return fail(hc, 125, "unknown shorthand flag: 'd' in -d\n\nUsage:  docker create [OPTIONS] IMAGE [COMMAND] [ARG...]\n\nRun 'docker create --help' for more information")
 	}
-	req := dockerCreateRequest{Image: image, Cmd: cmd, Env: o.env, Tty: o.tty, OpenStdin: o.interactive}
-	setHostConfig(&req, o)
+	req, err := dockerRunRequest(hc, o, image, cmd)
+	if err != nil {
+		return fail(hc, 125, "docker: %v\n\nRun 'docker create --help' for more information", err)
+	}
+	setMounts(&req, o, hc.Dir)
 	id, err := dockerCreateContainer(ctx, hc, req, o.name, "create")
 	if err != nil {
 		return err
@@ -887,6 +734,11 @@ func dockerStart(ctx context.Context, hc interp.HandlerContext, f dockerFlagValu
 		if err != nil {
 			return fail(hc, 1, "%v", err)
 		}
+		if keys := f["detach-keys"]; keys != "" {
+			if _, err := parseDetachKeys(keys); err != nil {
+				return fail(hc, 1, "Error response from daemon: Invalid detach keys (%s) provided", keys)
+			}
+		}
 		body, status, err := dockerCall(ctx, http.MethodPost, "/containers/"+c.ID+"/start", nil)
 		if err != nil {
 			return fail(hc, 1, "%v", err)
@@ -896,7 +748,9 @@ func dockerStart(ctx context.Context, hc interp.HandlerContext, f dockerFlagValu
 		}
 		// a container that ran already: what comes from now on
 		logs := status == http.StatusNoContent
-		return dockerAttachTo(ctx, hc, c, interactive && c.Config.OpenStdin, logs)
+		// start -a forwards the signals of the CLI, as docker attach does
+		return dockerAttachTo(ctx, hc, c, attachOptions{stdin: interactive && c.Config.OpenStdin, logs: logs,
+			detachKeys: f["detach-keys"], sigProxy: true})
 	}
 	var failed []string
 	for _, ref := range args {
@@ -942,7 +796,8 @@ func dockerRestart(ctx context.Context, hc interp.HandlerContext, f dockerFlagVa
 }
 
 // dockerAttach attaches to a running container: `docker attach CONTAINER`.
-// Ctrl-P Ctrl-Q detaches.
+// The detach keys (Ctrl-P Ctrl-Q) detach with a tty; without one, Ctrl-C
+// sends SIGINT to the container (--sig-proxy, true by default).
 func dockerAttach(ctx context.Context, hc interp.HandlerContext, f dockerFlagValues, args []string) error {
 	c, err := dockerInspectContainer(ctx, args[0])
 	if err != nil {
@@ -951,25 +806,57 @@ func dockerAttach(ctx context.Context, hc interp.HandlerContext, f dockerFlagVal
 	if !c.State.Running {
 		return fail(hc, 1, "You cannot attach to a stopped container, start it first")
 	}
-	return dockerAttachTo(ctx, hc, c, !f.bool("no-stdin") && c.Config.OpenStdin, false)
+	if c.State.Paused {
+		return fail(hc, 1, "You cannot attach to a paused container, unpause it first")
+	}
+	return dockerAttachTo(ctx, hc, c, attachOptions{stdin: !f.bool("no-stdin") && c.Config.OpenStdin,
+		detachKeys: f["detach-keys"], sigProxy: f["sig-proxy"] != "false", attach: true})
+}
+
+// attachOptions are the options of dockerAttachTo.
+type attachOptions struct {
+	stdin bool
+	// logs: from the start of the run, for a container that was just
+	// started (see attach in dockerapi)
+	logs       bool
+	detachKeys string // --detach-keys, "" for ctrl-p,ctrl-q
+	sigProxy   bool   // Ctrl-C is SIGINT for a container without a tty
+	attach     bool   // docker attach, not start -a
 }
 
 // dockerAttachTo streams a container until it exits and returns its exit
-// code, or until the user detaches. logs: from the start of the run, for a
-// container that was just started (see attach in dockerapi).
-func dockerAttachTo(ctx context.Context, hc interp.HandlerContext, c dockerInspectState, stdin, logs bool) error {
+// code, or until the user detaches.
+func dockerAttachTo(ctx context.Context, hc interp.HandlerContext, c dockerInspectState, o attachOptions) error {
 	q := "stream=1&stdout=1&stderr=1"
-	if stdin {
+	if o.stdin {
 		q += "&stdin=1"
 	}
-	if logs {
+	if o.logs {
 		q += "&logs=1"
 	}
-	detached, err := dockerStream(ctx, hc, "/containers/"+c.ID+"/attach?"+q, nil, c.Config.Tty, stdin, "/containers/"+c.ID+"/resize")
-	if err != nil {
-		return fail(hc, 1, "%v", err)
+	so := streamOptions{tty: c.Config.Tty, stdin: o.stdin, resizePath: "/containers/" + c.ID + "/resize"}
+	if o.detachKeys != "" {
+		// The daemon refuses keys it cannot read; the CLI watches for them.
+		q += "&detachKeys=" + url.QueryEscape(o.detachKeys)
+		so.detachKeys, _ = parseDetachKeys(o.detachKeys)
 	}
-	if detached || ctx.Err() != nil {
+	if o.sigProxy && !c.Config.Tty {
+		so.sigProxy = c.ID
+	}
+	detached, err := dockerStreamWith(ctx, hc, "/containers/"+c.ID+"/attach?"+q, nil, so)
+	if err != nil {
+		return fail(hc, 1, "Error response from daemon: %v", err)
+	}
+	if detached {
+		io.WriteString(termFrom(ctx), "\r\n")
+		if o.attach {
+			// the error of the escape proxy (moby/term), which docker
+			// attach returns; docker start -a and run say nothing
+			return fail(hc, 1, "read escape sequence")
+		}
+		return nil
+	}
+	if ctx.Err() != nil {
 		return nil
 	}
 	body, status, err := dockerCall(ctx, http.MethodPost, "/containers/"+c.ID+"/wait", nil)
@@ -984,79 +871,38 @@ func dockerAttachTo(ctx context.Context, hc interp.HandlerContext, c dockerInspe
 	return exitCode(waited.StatusCode)
 }
 
+// asciiKeys are the names of the control keys, by their code (moby/term).
+var asciiKeys = []string{
+	"ctrl-@", "ctrl-a", "ctrl-b", "ctrl-c", "ctrl-d", "ctrl-e", "ctrl-f", "ctrl-g", "ctrl-h", "ctrl-i", "ctrl-j",
+	"ctrl-k", "ctrl-l", "ctrl-m", "ctrl-n", "ctrl-o", "ctrl-p", "ctrl-q", "ctrl-r", "ctrl-s", "ctrl-t", "ctrl-u",
+	"ctrl-v", "ctrl-w", "ctrl-x", "ctrl-y", "ctrl-z", "ctrl-[", "ctrl-\\", "ctrl-]", "ctrl-^", "ctrl-_",
+}
+
+// parseDetachKeys reads --detach-keys as moby/term's ToBytes: single
+// characters, control keys ("ctrl-p") and DEL, separated by commas.
+func parseDetachKeys(keys string) ([]byte, error) {
+	var codes []byte
+next:
+	for _, key := range strings.Split(keys, ",") {
+		if len(key) == 1 {
+			codes = append(codes, key[0])
+			continue
+		}
+		for code, name := range asciiKeys {
+			if name == key {
+				codes = append(codes, byte(code))
+				continue next
+			}
+		}
+		if key != "DEL" {
+			return nil, fmt.Errorf("Unknown character: '%s'", key)
+		}
+		codes = append(codes, 127)
+	}
+	return codes, nil
+}
+
 // ---- images, pull, rmi ----
-
-type dockerImageSummary struct {
-	ID          string `json:"Id"`
-	RepoTags    []string
-	RepoDigests []string
-	Created     int64
-	Size        int64
-}
-
-// imageRow is a line of docker images, the fields its templates know.
-type imageRow struct {
-	Repository, Tag, Digest, ID, CreatedSince, CreatedAt, Size string
-}
-
-var imageHeader = imageRow{Repository: "REPOSITORY", Tag: "TAG", Digest: "DIGEST", ID: "IMAGE ID", CreatedSince: "CREATED", CreatedAt: "CREATED AT", Size: "SIZE"}
-
-// imageRows are the lines of docker images: one per tag, or one with tag
-// <none> for an image that has only a digest.
-func imageRows(imgs []dockerImageSummary, filter string, trunc bool, now time.Time) []imageRow {
-	var rows []imageRow
-	for _, img := range imgs {
-		base := imageRow{
-			ID:           img.ID,
-			CreatedSince: units.HumanDuration(now.Sub(time.Unix(img.Created, 0))) + " ago",
-			CreatedAt:    time.Unix(img.Created, 0).String(),
-			Size:         units.HumanSizeWithPrecision(float64(img.Size), 3),
-			Digest:       "<none>",
-		}
-		if trunc {
-			base.ID = truncateID(img.ID)
-		}
-		digests := map[string]string{} // repo -> digest
-		for _, d := range img.RepoDigests {
-			repo, dg, _ := strings.Cut(d, "@")
-			digests[repo] = dg
-		}
-		tagged := map[string]bool{}
-		for _, t := range img.RepoTags {
-			i := strings.LastIndexByte(t, ':')
-			r := base
-			r.Repository, r.Tag = t[:i], t[i+1:]
-			if d, ok := digests[r.Repository]; ok {
-				r.Digest = d
-			}
-			tagged[r.Repository] = true
-			rows = append(rows, r)
-		}
-		for repo, d := range digests {
-			if !tagged[repo] {
-				r := base
-				r.Repository, r.Tag, r.Digest = repo, "<none>", d
-				rows = append(rows, r)
-			}
-		}
-		if len(img.RepoTags) == 0 && len(digests) == 0 {
-			r := base
-			r.Repository, r.Tag = "<none>", "<none>"
-			rows = append(rows, r)
-		}
-	}
-	if filter == "" {
-		return rows
-	}
-	repo, tag, _ := strings.Cut(filter, ":")
-	var out []imageRow
-	for _, r := range rows {
-		if (r.Repository == repo || r.Repository == strings.TrimPrefix(repo, "library/")) && (tag == "" || r.Tag == tag) {
-			out = append(out, r)
-		}
-	}
-	return out
-}
 
 // dockerImages lists the images of the tab: `docker images`. The VM worker
 // pulls them into the image store of the browser, which the pods use too.
@@ -1065,35 +911,15 @@ func dockerImages(ctx context.Context, hc interp.HandlerContext, f dockerFlagVal
 	if _, err := dockerGet(ctx, "/images/json", &imgs); err != nil {
 		return fail(hc, 1, "%v", err)
 	}
-	filter := ""
 	if len(args) > 0 {
-		filter = args[0]
+		imgs = matchImageRef(imgs, args[0])
 	}
-	rows := imageRows(imgs, filter, !f.bool("no-trunc"), time.Now())
-	format := f["format"]
-	switch {
-	case f.bool("quiet"):
-		// each image once
-		seen := map[string]bool{}
-		var b strings.Builder
-		for _, r := range rows {
-			if !seen[r.ID] {
-				seen[r.ID] = true
-				fmt.Fprintln(&b, r.ID)
-			}
-		}
-		io.WriteString(hc.Stdout, b.String())
-		return nil
-	case format == "" && f.bool("digests"):
-		format = "table {{.Repository}}\t{{.Tag}}\t{{.Digest}}\t{{.ID}}\t{{.CreatedSince}}\t{{.Size}}"
-	case format == "":
-		format = "table {{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.CreatedSince}}\t{{.Size}}"
+	var out bytes.Buffer
+	if err := writeImages(&out, f["format"], f.bool("quiet"), f.bool("digests"), !f.bool("no-trunc"), imgs, time.Now()); err != nil {
+		return fail(hc, 1, "%v", err)
 	}
-	out := make([]any, len(rows))
-	for i, r := range rows {
-		out[i] = r
-	}
-	return writeFormatted(hc, format, imageHeader, out)
+	hc.Stdout.Write(out.Bytes())
+	return nil
 }
 
 // familiarRef is an image reference as Docker shows it, with its tag:

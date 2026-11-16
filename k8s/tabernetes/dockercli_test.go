@@ -24,7 +24,8 @@ func TestParseDockerRun(t *testing.T) {
 			o: dockerRunOptions{detach: true, publish: []string{"8080:80", "443", "8443:443/tcp", "127.0.0.1::53", "1:2"}}, image: "nginx"},
 		{args: []string{"-p", "x:80", "nginx"}, err: true},
 		{args: []string{"-p"}, err: true},
-		{args: []string{"--publish-all", "nginx"}, err: true},
+		{args: []string{"--publish-all", "nginx"}, o: dockerRunOptions{publishAll: true}, image: "nginx"},
+		{args: []string{"--no-such-flag", "nginx"}, err: true},
 		{args: []string{"--name"}, err: true},
 		{args: []string{"-it"}, err: true},
 	} {

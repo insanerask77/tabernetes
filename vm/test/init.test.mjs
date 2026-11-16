@@ -246,6 +246,20 @@ test("attach", { skip: !linux }, async (t) => {
     assert.deepEqual([a.out, a.exit], ["got:hello\nbye\n", 4]);
     await until(() => vm.lines.includes("exit 4"));
   });
+
+  await t.test("stdinOnce with a tty: a detachable attach (docker) keeps stdin open", async (t) => {
+    const vm = await start({ args: main, stdin: true, stdinOnce: true, tty: true });
+    t.after(vm.stop);
+    const a = await session(vm, { attach: true, stdin: true, detachable: true });
+    a.send(1);
+    a.c.destroy();
+    await sleep(300);
+    assert.deepEqual(vm.lines, ["started"]);
+    // kubectl attach closes it
+    const b = await session(vm, { attach: true, stdin: true });
+    b.send(1);
+    await until(() => vm.lines.includes("exit 4"));
+  });
 });
 
 test("start errors", { skip: !linux }, async (t) => {
@@ -317,4 +331,34 @@ test("signals", { skip: !linux }, async (t) => {
     const s = await run(vm, { cmd: ["grep", "SigIgn", "/proc/self/status"] });
     assert.match(s.out, /^SigIgn:\s+0+\n$/);
   });
+});
+
+// docker top: {"ps": true} lists the processes from /proc (ps_report).
+test("process list", { skip: !linux }, async (t) => {
+  const vm = await start({ args: ["sleep", "1000"] });
+  t.after(vm.stop);
+  const s = await run(vm, { ps: true });
+  assert.deepEqual([s.exit, s.error], [0, null]);
+  const lines = s.out.split("\n");
+  assert.match(lines[0], /^uptime \d+(\.\d+)?$/);
+  assert.match(lines[1], /^memtotal \d+$/);
+  // "<uid>\t<stat>\t<cmdline>": the main process is there with its arguments
+  assert.ok(lines.some((l) => /^\d+\t\d+ \(sleep\) [A-Z] .*\tsleep 1000$/.test(l)), s.out);
+});
+
+// docker stats and docker cp: {"stats": true} answers with /proc, {"sync":
+// true} syncs and drops the caches (k8s/tabernetes/dockerstats.go).
+test("stats and sync", { skip: !linux }, async (t) => {
+  const vm = await start({ args: ["sleep", "1000"] });
+  t.after(vm.stop);
+  const s = await run(vm, { stats: true });
+  assert.deepEqual([s.exit, s.error], [0, null]);
+  for (const section of ["== /proc/stat\ncpu ", "== /proc/meminfo\nMemTotal:", "== /proc/net/dev\n", "== pids\n"]) {
+    assert.ok(s.out.includes(section), `${section} in ${s.out.slice(0, 200)}`);
+  }
+  // the host has more processes than the container, but at least sleep
+  assert.ok(Number(s.out.split("== pids\n")[1]) >= 1);
+  // drop_caches needs root: on the host, only the sync runs, or it fails
+  const y = await run(vm, { sync: true });
+  assert.ok(y.exit === 0 || /drop caches/.test(y.error), `${y.exit} ${y.error}`);
 });

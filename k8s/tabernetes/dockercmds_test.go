@@ -69,9 +69,8 @@ func TestPSTable(t *testing.T) {
 		{ID: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2", Names: []string{"/web"}, Image: "alpine",
 			Command: "sh -c 'exit 3'", Created: now.Add(-90 * time.Second).Unix(), State: "exited", Status: "Exited (3) 5 seconds ago"},
 	}
-	rows := []any{psRowOf(cs[0], true, now), psRowOf(cs[1], true, now)}
 	var out bytes.Buffer
-	if err := writeFormattedTo(&out, psTable, psHeader, rows); err != nil {
+	if err := writePS(&out, psOptions{}, cs, true, now); err != nil {
 		t.Fatal(err)
 	}
 	want := `CONTAINER ID   IMAGE     COMMAND                  CREATED              STATUS                     PORTS                  NAMES
@@ -90,13 +89,8 @@ func TestImageRows(t *testing.T) {
 			Created: now.Add(-49 * time.Hour).Unix(), Size: 192_000_000},
 		{ID: "sha256:0123456789abcdef", RepoDigests: []string{"alpine@sha256:def"}, Created: now.Add(-3 * 7 * 24 * time.Hour).Unix(), Size: 7_830_000},
 	}
-	rows := imageRows(imgs, "", true, now)
 	var out bytes.Buffer
-	var any []any
-	for _, r := range rows {
-		any = append(any, r)
-	}
-	if err := writeFormattedTo(&out, "table {{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.CreatedSince}}\t{{.Size}}", imageHeader, any); err != nil {
+	if err := writeImages(&out, "", false, false, true, imgs, now); err != nil {
 		t.Fatal(err)
 	}
 	want := `REPOSITORY   TAG       IMAGE ID       CREATED       SIZE
@@ -107,8 +101,27 @@ alpine       <none>    0123456789ab   3 weeks ago   7.83MB
 	if out.String() != want {
 		t.Errorf("images:\n%s\nwant:\n%s", out.String(), want)
 	}
-	if got := imageRows(imgs, "nginx:latest", true, now); len(got) != 1 || got[0].Tag != "latest" {
+	out.Reset()
+	writeImages(&out, "", false, true, true, imgs, now)
+	if !strings.Contains(out.String(), "nginx        latest    sha256:abc   4f67c83422ec") || !strings.Contains(out.String(), "alpine       <none>    sha256:def   0123456789ab") {
+		t.Errorf("images --digests:\n%s", out.String())
+	}
+	if got := matchImageRef(imgs, "nginx:latest"); len(got) != 1 || len(got[0].RepoTags) != 1 || got[0].RepoTags[0] != "nginx:latest" {
 		t.Errorf("filter nginx:latest: %+v", got)
+	}
+	if got := matchImageRef(imgs, "ngi*"); len(got) != 1 || len(got[0].RepoTags) != 2 {
+		t.Errorf("filter ngi*: %+v", got)
+	}
+	// docker images -q: one ID per row, as the docker CLI prints it
+	out.Reset()
+	writeImages(&out, "", true, false, true, imgs, now)
+	if out.String() != "4f67c83422ec\n4f67c83422ec\n0123456789ab\n" {
+		t.Errorf("images -q: %q", out.String())
+	}
+	out.Reset()
+	writeImages(&out, "json", false, false, true, imgs[:1], now)
+	if want := `{"Containers":"0","CreatedAt":"` + time.Unix(imgs[0].Created, 0).String() + `","CreatedSince":"2 days ago","Digest":"\u003cnone\u003e","ID":"4f67c83422ec","Repository":"nginx","SharedSize":"0B","Size":"192MB","Tag":"1.27","UniqueSize":"192MB","VirtualSize":"192MB"}`; !strings.HasPrefix(out.String(), want+"\n") {
+		t.Errorf("images --format json:\n%s\nwant:\n%s", out.String(), want)
 	}
 }
 

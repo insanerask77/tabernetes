@@ -191,7 +191,8 @@ func dockerKill(ctx context.Context, hc interp.HandlerContext, args []string) er
 }
 
 // dockerRM is `docker rm [-f] CONTAINER...`. With -f a running container
-// gets SIGKILL first. -v and -l are accepted: there are no volumes or links.
+// gets SIGKILL first. -v removes the anonymous volumes of the container
+// too; -l is accepted: there are no links.
 func dockerRM(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	flags, containers, err := dockerRMFlags.parse(args)
 	if err != nil {
@@ -200,9 +201,16 @@ func dockerRM(ctx context.Context, hc interp.HandlerContext, args []string) erro
 	if len(containers) == 0 {
 		return fail(hc, 1, "docker: \"rm\" requires at least 1 argument")
 	}
-	query := ""
+	q := url.Values{}
 	if force, _ := strconv.ParseBool(flags["force"]); force {
-		query = "?force=1"
+		q.Set("force", "1")
+	}
+	if v, _ := strconv.ParseBool(flags["volumes"]); v {
+		q.Set("v", "1")
+	}
+	query := ""
+	if len(q) > 0 {
+		query = "?" + q.Encode()
 	}
 	return dockerEach(ctx, hc, containers, http.MethodDelete,
 		func(c string) string { return "/containers/" + url.PathEscape(c) + query },

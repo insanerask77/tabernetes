@@ -16,6 +16,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"syscall/js"
 	"time"
@@ -30,7 +31,8 @@ import (
 
 // Where containerd keeps its data, and the consoles of the containers
 // (v86.LogDir). The file system of the page keeps all three across a reload
-// (keptPaths in web/src/fs.js; the lists must match), the state too: after a
+// (keptPaths in web/src/fs.js; the lists must match; it keeps the metadata
+// of the volumes in /var/lib/docker too, dockerapi.DefaultVolumesRoot), the state too: after a
 // reload containerd loads the shims of the old tasks from it, and they
 // report the tasks as stopped, with their exit codes (v86.NewBundleService).
 // Like `docker ps -a` after a restart of the Docker daemon, the containers
@@ -40,6 +42,9 @@ const (
 	containerdRoot  = "/var/lib/containerd"
 	containerdState = "/run/containerd"
 	containerLogs   = "/var/log/v86"
+	// dockerAutostartFile exists while a container has a restart policy
+	// (dockerapi.Server.AutostartFile). It is kept with containerd's data.
+	dockerAutostartFile = containerdRoot + "/tabernetes-autostart"
 )
 
 var docker struct {
@@ -47,11 +52,56 @@ var docker struct {
 	started bool
 	err     error
 
-	// vm is the vm object of the tab whose `docker` command came last: with
-	// several tabs, the containers run in the tab that asked for them.
+	// vm is the vm object of the tab whose `docker` command came last. A
+	// container runs in the tab that started it (tabs, by container id, from
+	// the header of the request, dockerTab); vm is only the fallback for a
+	// start without a tab.
 	vmMu sync.Mutex
 	vm   js.Value
+	tabs map[string]js.Value
 	rt   *jsruntime.Runtime // once containerd runs
+	srv  *dockerapi.Server  // once the Docker API serves
+}
+
+// dockerTabHeader carries the name of the tab (its session) in every
+// request of the docker CLI to the Docker API.
+const dockerTabHeader = "X-Tabernetes-Tab"
+
+// dockerTab notes the tab of the request that starts container id
+// (dockerapi Server.Tab). Two tabs may start containers at the same moment:
+// each VM goes to the tab whose request started it.
+func dockerTab(r *http.Request, id string) {
+	name := r.Header.Get(dockerTabHeader)
+	if name == "" {
+		return
+	}
+	sessionsMu.Lock()
+	s := sessions[name]
+	sessionsMu.Unlock()
+	if s == nil {
+		return
+	}
+	vm := s.host.Get("vm")
+	if vm.Type() != js.TypeObject {
+		return
+	}
+	docker.vmMu.Lock()
+	if docker.tabs == nil {
+		docker.tabs = map[string]js.Value{}
+	}
+	docker.tabs[id] = vm
+	docker.vmMu.Unlock()
+}
+
+// dockerVMFor returns the vm object for the VM of container id: the tab
+// that started it, else the tab of the last docker command.
+func dockerVMFor(id string) js.Value {
+	docker.vmMu.Lock()
+	defer docker.vmMu.Unlock()
+	if vm, ok := docker.tabs[id]; ok {
+		return vm
+	}
+	return docker.vm
 }
 
 // dockerVM returns the vm object for the next container (jsruntime).
@@ -153,7 +203,15 @@ func dockerTabGone(s *session) {
 	}
 	docker.vmMu.Lock()
 	if docker.vm.Equal(vm) {
-		docker.vm = js.Undefined()
+		// New containers, and the restarts of the restart policies, go
+		// to another open tab; with none, to the next tab that opens
+		// (dockerAutostart).
+		docker.vm = otherTabVM(s)
+	}
+	for id, v := range docker.tabs {
+		if v.Equal(vm) {
+			delete(docker.tabs, id)
+		}
 	}
 	rt := docker.rt
 	docker.vmMu.Unlock()
@@ -198,7 +256,10 @@ func startDocker() error {
 	rt := jsruntime.NewRuntime(dockerVM)
 	rt.Signal = signalContainer
 	rt.Admit = admitContainer
+	rt.VMFor = dockerVMFor
 	v86.LogDir = containerLogs
+	// the files of docker cp, kept with the data of containerd
+	v86.CopiedDir = containerdRoot + "/io.tabernetes.docker-cp"
 	docker.vmMu.Lock()
 	docker.rt = rt
 	docker.vmMu.Unlock()
@@ -215,9 +276,70 @@ func startDocker() error {
 	srv.Ports = dockerPorts(rt)     // docker run -p (dockerports.go)
 	srv.Images = dockerImageStore{} // dockerimages.go
 	srv.Addresses = rt.Address
+	srv.AutostartFile = dockerAutostartFile
+	docker.vmMu.Lock()
+	docker.srv = srv
+	docker.vmMu.Unlock()
+	srv.Tab = dockerTab
+	srv.Files = dockerFiles{rt}      // docker cp (dockercp.go)
+	srv.Volumes = dockerVolumeData{} // dockervolumes.go
 	go http.Serve(l, srv)
 	fmt.Printf("tabernetes: containerd started in %s\n", time.Since(start).Round(time.Millisecond))
+	// like dockerd at its start: the containers whose restart policy
+	// wants them running (always, unless-stopped, on-failure) start again
+	go srv.RestartContainers(ctx)
 	return nil
+}
+
+// otherTabVM returns the vm object of an open tab other than s, or
+// undefined.
+func otherTabVM(s *session) js.Value {
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
+	for _, o := range sessions {
+		if o == s {
+			continue
+		}
+		if vm := o.host.Get("vm"); vm.Type() == js.TypeObject {
+			return vm
+		}
+	}
+	return js.Undefined()
+}
+
+// dockerAutostart runs when a tab opens. If a container has a restart
+// policy, it starts containerd, as a system starts dockerd at boot: after
+// the control plane starts again, such containers come back without a
+// docker command. If containerd runs but no tab was left for containers
+// (the last tab reloaded: its VMs ended with it, and their restarts found
+// no tab), this tab takes them, and the restarts that failed run again.
+func dockerAutostart(s *session) {
+	if _, err := os.Stat(dockerAutostartFile); err != nil {
+		return
+	}
+	vm := s.host.Get("vm")
+	if vm.Type() != js.TypeObject {
+		return
+	}
+	docker.vmMu.Lock()
+	orphaned := docker.vm.Type() != js.TypeObject
+	if orphaned {
+		docker.vm = vm
+	}
+	srv := docker.srv
+	docker.vmMu.Unlock()
+	if srv != nil && orphaned {
+		go srv.RetryRestarts(context.Background())
+		return
+	}
+	docker.mu.Lock()
+	defer docker.mu.Unlock()
+	if !docker.started {
+		docker.started = true
+		if docker.err = startDocker(); docker.err != nil {
+			fmt.Printf("tabernetes: start containerd for the restart policies: %v\n", docker.err)
+		}
+	}
 }
 
 // dockerStreams gives the Docker API attach and exec (v86.Streamer): the
@@ -245,8 +367,10 @@ func (d dockerStreams) Attach(ctx context.Context, id string, stdin io.Reader, o
 	if stdin != nil {
 		// Only stdin and the size go over the attach of init; its copy of
 		// the output is dropped, the console has it already.
+		// detachable: with a tty, the end of the attach (the detach keys)
+		// leaves the stdin of the container open, as in dockerd.
 		if dial, err := d.dialer(id); err == nil {
-			go streamVM(ctx, dial, true, nil, stdin, io.Discard, io.Discard, true, terminalSizes(ctx, resize))
+			go streamVMWith(ctx, dial, true, nil, stdin, io.Discard, io.Discard, true, terminalSizes(ctx, resize), map[string]any{"detachable": true})
 		}
 	}
 	select {
@@ -268,6 +392,11 @@ func (d dockerStreams) Exec(ctx context.Context, id string, cmd []string, tty bo
 		return ce.Code, nil
 	}
 	return 0, err
+}
+
+// FollowLog is docker logs -f of a running container (dockerapi/logs.go).
+func (d dockerStreams) FollowLog(id string) ([]v86.LogRecord, <-chan v86.LogRecord, <-chan struct{}, func(), error) {
+	return d.rt.FollowLog(id)
 }
 
 // signalContainer sends sig to the main process of a container, over the

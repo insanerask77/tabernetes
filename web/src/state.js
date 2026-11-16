@@ -12,12 +12,15 @@
 //                  cache "tabernetes-configs" (vmworker.js), and the models
 //                  of llm pods in the caches of WebLLM
 //   the pod VMs    OPFS tabernetes/vm: saved states of booted VMs (vmstate.js)
+//   the volumes    OPFS tabernetes/volumes: the files of Docker volumes
+//                  (volumes.js), their metadata in /var/lib/docker (fs.js)
 //
 // IndexedDB, OPFS and the caches share the quota of the origin, a part of the
 // free disk. localStorage would hold a few MB of strings only. forget deletes
 // all of it.
 
 import { forgetStates } from "./vmstate.js";
+import { forgetVolumes } from "./volumes.js";
 
 const DB = "tabernetes";
 
@@ -273,5 +276,6 @@ export async function forget() {
     }
   } catch { /* no Cache Storage */ }
   await forgetStates().catch(() => {});
+  await forgetVolumes().catch(() => {});
   return forgetLayers().catch(() => 0);
 }

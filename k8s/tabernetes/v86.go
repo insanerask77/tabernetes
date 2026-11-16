@@ -113,6 +113,11 @@ func (v *v86VM) start(ctx context.Context, log io.Writer, pull *imagePull) error
 		},
 	}
 
+	// emptyDir volumes (tabvolumes.go)
+	if mounts := v.tp.mountSpecs(); len(mounts) > 0 {
+		opts["mounts"] = mounts
+	}
+
 	fn := func(f func(a []js.Value)) js.Func {
 		jf := js.FuncOf(func(_ js.Value, a []js.Value) any { f(a); return nil })
 		v.funcs = append(v.funcs, jf)

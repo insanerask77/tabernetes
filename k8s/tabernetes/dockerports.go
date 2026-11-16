@@ -93,16 +93,33 @@ type dockerHostConfig struct {
 	// AutoRemove: the daemon removes the container when it exits (--rm),
 	// also when nobody waits for it (-d).
 	AutoRemove bool `json:"AutoRemove,omitempty"`
+	// -P, -m, --restart and --init (dockerrunflags.go)
+	PublishAllPorts bool                 `json:"PublishAllPorts,omitempty"`
+	Memory          int64                `json:"Memory,omitempty"`
+	RestartPolicy   *dockerRestartPolicy `json:"RestartPolicy,omitempty"`
+	Init            *bool                `json:"Init,omitempty"`
+	// --log-driver and --log-opt (dockerlogs.go)
+	LogConfig *dockerLogConfig `json:"LogConfig,omitempty"`
+	// Binds and Mounts: -v and --mount (dockervolumes.go)
+	dockerMountConfig
 }
 
 // setHostConfig puts the options of docker run and create that belong to
-// HostConfig (-p, --rm) and the exposed ports into the create request.
+// HostConfig (-p, -P, --rm, -m, --restart, --init) and the exposed ports
+// into the create request.
 // parseDockerRun checked the -p specs already.
 func setHostConfig(req *dockerCreateRequest, o dockerRunOptions) {
-	hcfg := &dockerHostConfig{AutoRemove: o.rm}
+	hcfg := &dockerHostConfig{AutoRemove: o.rm, PublishAllPorts: o.publishAll, Memory: o.memory}
 	if exposed, bindings, _ := dockerPublish(o.publish); len(bindings) > 0 {
 		req.ExposedPorts, hcfg.PortBindings = exposed, bindings
 	}
+	if o.restart.Name != "" {
+		hcfg.RestartPolicy = &o.restart
+	}
+	if o.init {
+		hcfg.Init = &o.init
+	}
+	hcfg.LogConfig = logConfigOf(o)
 	req.HostConfig = hcfg
 }
 

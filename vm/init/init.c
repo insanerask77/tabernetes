@@ -25,10 +25,14 @@
 // that, both sides send frames: one byte type, four bytes big-endian length,
 // the payload. A request {"signal": N} sends signal N to the main process
 // instead, for docker stop and kill and for a pod that is deleted
-// (signal_main).
+// (signal_main). A request {"ps": true} lists the processes, for docker top
+// (ps_report). {"stats": true} answers with what docker stats shows
+// (stats_report), {"sync": true} makes the 9p tree and the VM agree for
+// docker cp (sync_caches).
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <net/if.h>
@@ -365,6 +369,7 @@ static int js_object(json_t *j, void (*field)(json_t *, const char *, void *), v
 // config is the container, written by the page (web/src/vmworker.js).
 typedef struct {
   strv_t args, env;
+  strv_t readonly; // mount points of read-only volumes and bind mounts
   char *cwd, *user, *hostname, *ip, *gateway;
   int stdin_, stdin_once, tty;
 } config_t;
@@ -373,6 +378,7 @@ static void config_field(json_t *j, const char *k, void *arg) {
   config_t *c = arg;
   if (!strcmp(k, "args")) js_strings(j, &c->args);
   else if (!strcmp(k, "env")) js_strings(j, &c->env);
+  else if (!strcmp(k, "readonly")) js_strings(j, &c->readonly);
   else if (!strcmp(k, "cwd")) c->cwd = js_string(j);
   else if (!strcmp(k, "user")) c->user = js_string(j);
   else if (!strcmp(k, "hostname")) c->hostname = js_string(j);
@@ -743,6 +749,7 @@ typedef struct session {
   int gone;       // the peer went away
   int dropped;    // an attach that was too slow
   int ended;      // endStdin ran
+  int detachable; // a docker attach: with a tty, its end keeps stdin open
 } session_t;
 
 static session_t *sessions;
@@ -783,6 +790,10 @@ static void end_stdin(session_t *s) {
     return;
   }
   if (s->ended || !s->stdin_on) return;
+  // dockerd closes the stdin of the container at the end of an attach only
+  // without a tty: docker attach -it ends with Ctrl-P Ctrl-Q, and the
+  // shell in the container runs on. kubectl attach closes it either way.
+  if (s->detachable && main_proc.pty >= 0) return;
   s->ended = 1;
   if (main_stdin_once && !main_stdin_closed) {
     main_stdin_closed = 1;
@@ -843,6 +854,9 @@ typedef struct {
   strv_t cmd;
   int tty, stdin_, attach, rows, cols;
   int has_signal, signal;
+  int ps;
+  int detachable;
+  int stats, sync;
 } request_t;
 
 static void request_field(json_t *j, const char *k, void *arg) {
@@ -854,6 +868,10 @@ static void request_field(json_t *j, const char *k, void *arg) {
   else if (!strcmp(k, "rows")) r->rows = js_number(j);
   else if (!strcmp(k, "cols")) r->cols = js_number(j);
   else if (!strcmp(k, "signal")) r->has_signal = 1, r->signal = js_number(j);
+  else if (!strcmp(k, "ps")) r->ps = js_bool(j);
+  else if (!strcmp(k, "detachable")) r->detachable = js_bool(j);
+  else if (!strcmp(k, "stats")) r->stats = js_bool(j);
+  else if (!strcmp(k, "sync")) r->sync = js_bool(j);
   else js_skip(j);
 }
 
@@ -877,6 +895,127 @@ static int signal_main(int sig) {
   return 0;
 }
 
+// ps_report sends the processes of the VM as stdout, for docker top:
+// dockerd runs ps on the host, but an image may have no ps at all. The
+// first line is "uptime <seconds>", the second "memtotal <kB>", then one
+// line per process: "<uid>\t<the line of /proc/<pid>/stat>\t<cmdline>",
+// with the arguments of cmdline joined by spaces. The page formats the
+// table and leaves out init and the kernel threads (k8s/tabernetes).
+static void ps_report(session_t *s) {
+  buf_t b = {0};
+  char path[64];
+  size_t n;
+  char *up = read_file("/proc/uptime", &n);
+  buf_add(&b, "uptime ", 7);
+  if (up) buf_add(&b, up, strcspn(up, " \n"));
+  buf_add(&b, "\n", 1);
+  free(up);
+  char *mem = read_file("/proc/meminfo", &n);
+  long total = 0;
+  if (mem) sscanf(mem, "MemTotal: %ld", &total);
+  free(mem);
+  char num[32];
+  snprintf(num, sizeof(num), "memtotal %ld\n", total);
+  buf_add(&b, num, strlen(num));
+  DIR *d = opendir("/proc");
+  struct dirent *e;
+  while (d && (e = readdir(d))) {
+    if (!is_number(e->d_name)) continue;
+    struct stat st;
+    snprintf(path, sizeof(path), "/proc/%s", e->d_name);
+    if (stat(path, &st) < 0) continue;
+    snprintf(path, sizeof(path), "/proc/%s/stat", e->d_name);
+    char *line = read_file(path, &n);
+    if (!line || !n) {
+      free(line);
+      continue; // it ended a moment ago
+    }
+    snprintf(path, sizeof(path), "/proc/%s/cmdline", e->d_name);
+    size_t cn = 0;
+    char *cmd = read_file(path, &cn);
+    while (cmd && cn > 0 && cmd[cn - 1] == 0) cn--;
+    for (size_t i = 0; cmd && i < cn; i++) {
+      if (!cmd[i]) cmd[i] = ' ';
+      else if (cmd[i] == '\n' || cmd[i] == '\t') cmd[i] = '?';
+    }
+    while (n > 0 && line[n - 1] == '\n') n--;
+    snprintf(num, sizeof(num), "%u\t", (unsigned)st.st_uid);
+    buf_add(&b, num, strlen(num));
+    buf_add(&b, line, n);
+    buf_add(&b, "\t", 1);
+    if (cmd) buf_add(&b, cmd, cn);
+    buf_add(&b, "\n", 1);
+    free(line);
+    free(cmd);
+  }
+  if (d) closedir(d);
+  frame(s, OUT_STDOUT, b.b, b.len);
+  buf_free(&b);
+}
+
+// stats_report sends what docker stats shows, read from the kernel of the
+// VM, as one stdout frame: the cpu line of /proc/stat, /proc/meminfo,
+// /proc/net/dev and the number of processes of the container (all but init
+// and the kernel threads), each after a line "== <name>". The page parses
+// it (k8s/tabernetes/dockerstats.go). Docker reads the same numbers from
+// the cgroup of the container.
+static void stats_report(session_t *s) {
+  buf_t b = {0};
+  static const char *files[] = {"/proc/stat", "/proc/meminfo", "/proc/net/dev"};
+  for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+    size_t n = 0;
+    char *t = read_file(files[i], &n);
+    buf_add(&b, "== ", 3);
+    buf_add(&b, files[i], strlen(files[i]));
+    buf_add(&b, "\n", 1);
+    if (t) {
+      // of /proc/stat only the line of all CPUs
+      char *nl = i == 0 ? memchr(t, '\n', n) : NULL;
+      if (nl) n = nl - t + 1;
+      buf_add(&b, t, n);
+      free(t);
+    }
+  }
+  int pids = 0;
+  DIR *d = opendir("/proc");
+  struct dirent *e;
+  while (d && (e = readdir(d))) {
+    char *end;
+    long pid = strtol(e->d_name, &end, 10);
+    if (*end || pid <= 2) continue; // init, kthreadd
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%ld/stat", pid);
+    char *t = read_file(path, NULL);
+    if (!t) continue;
+    // "pid (comm) state ppid ...": comm may hold spaces and parentheses
+    char *rp = strrchr(t, ')');
+    int ppid = -1;
+    if (rp) sscanf(rp + 1, " %*c %d", &ppid);
+    free(t);
+    if (ppid != 2) pids++; // the children of kthreadd are kernel threads
+  }
+  if (d) closedir(d);
+  char tail[64];
+  int n = snprintf(tail, sizeof(tail), "== pids\n%d\n", pids);
+  buf_add(&b, tail, n);
+  frame(s, OUT_STDOUT, b.b, b.len);
+  buf_free(&b);
+}
+
+// sync_caches makes the files of the 9p tree and the VM agree, for docker
+// cp, which reads and writes the tree in the page: sync writes what the
+// container wrote to the tree, and dropping the caches makes the kernel
+// read again what the page wrote (the root is mounted with cache=loose).
+static int sync_caches(void) {
+  sync();
+  int fd = open("/proc/sys/vm/drop_caches", O_WRONLY | O_CLOEXEC);
+  if (fd < 0) return 0; // a kernel without sysctl: only the sync
+  ssize_t w = write(fd, "3\n", 2);
+  close(fd);
+  if (w < 0) return fail("drop caches: %s", errtext(errno));
+  return 0;
+}
+
 static void session_request(session_t *s, const char *line, size_t n) {
   request_t r = {0};
   json_t j = {line, line + n, 0};
@@ -894,6 +1033,22 @@ static void session_request(session_t *s, const char *line, size_t n) {
     s->closing = 1;
     goto out;
   }
+  if (r.ps) {
+    ps_report(s);
+    frame_code(s, 0);
+    s->closing = 1;
+    goto out;
+  }
+  if (r.stats || r.sync) {
+    if (r.sync && sync_caches() < 0) {
+      frame_error(s, err_msg);
+      goto out;
+    }
+    if (r.stats) stats_report(s);
+    frame_code(s, 0);
+    s->closing = 1;
+    goto out;
+  }
   if (r.attach) {
     s->kind = S_ATTACH;
     if (!main_started || main_exited) {
@@ -901,6 +1056,7 @@ static void session_request(session_t *s, const char *line, size_t n) {
       goto out;
     }
     s->stdin_on = r.stdin_ && main_proc.stdin_fd >= 0;
+    s->detachable = r.detachable;
     if (main_proc.pty >= 0 && r.rows > 0) set_size(main_proc.pty, r.rows, r.cols);
     goto out;
   }
@@ -1421,6 +1577,15 @@ static int setup_container(config_t *c) {
   if (staged) *c = staged_config;
   else if (load_config("/.tabernetes/config.json", c) < 0) return -1;
   if (!c->args.n) return fail("no command specified");
+
+  // docker run -v x:/p:ro: the page mounts the volume at /p in the 9p tree
+  // (web/src/volumes.js). A bind mount of /p onto itself, remounted
+  // read-only, makes writes fail with EROFS, as in Docker.
+  for (int i = 0; i < c->readonly.n; i++) {
+    const char *p = c->readonly.v[i];
+    if (mount(p, p, NULL, MS_BIND | MS_REC, NULL) < 0) return fail("bind mount %s: %s", p, errtext(errno));
+    if (mount(NULL, p, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) return fail("remount %s read-only: %s", p, errtext(errno));
+  }
 
   // what the kubelet does for every container; /etc/hosts and
   // /etc/resolv.conf come from the page (web/src/vmworker.js)
