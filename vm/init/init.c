@@ -903,7 +903,7 @@ static int signal_main(int sig) {
 // table and leaves out init and the kernel threads (k8s/tabernetes).
 static void ps_report(session_t *s) {
   buf_t b = {0};
-  char path[64];
+  char path[300]; // "/proc/", a name of up to 255 bytes, "/cmdline"
   size_t n;
   char *up = read_file("/proc/uptime", &n);
   buf_add(&b, "uptime ", 7);
