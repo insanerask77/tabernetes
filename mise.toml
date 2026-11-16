@@ -77,6 +77,10 @@ sum="$(find vm -type f | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256 | c
 if [ "$(cat "$out/.sum" 2>/dev/null)" != "$sum" ]; then
   rm -rf "$out"
   docker build --output "type=local,dest=$out" vm
+  # The local exporter keeps the modes of the image (dist/vm 0700, seabios.bin
+  # 0600). A web server that runs as another user (nginx) cannot read them
+  # and answers 404, and then the VM of every tab pod hangs at boot.
+  chmod -R a+rX "$out"
   echo "$sum" > "$out/.sum"
 fi
 '''
