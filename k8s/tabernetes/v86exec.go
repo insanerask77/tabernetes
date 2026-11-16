@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"time"
 
@@ -18,10 +19,11 @@ import (
 )
 
 // kubectl exec and attach for a pod in v86. Init of the VM listens on
-// vmExecPort (vm/init/exec.go), and the kubelet connects to it through the
+// vmExecPort (vm/init/init.c), and the kubelet connects to it through the
 // network card of the VM, as port-forward does. The kubelet sends one line of
 // JSON, then both sides send frames: one byte type, four bytes big-endian
-// length, the payload.
+// length, the payload. The same port takes signals for the main process
+// (signalVM).
 
 const vmExecPort = 60250
 
@@ -52,7 +54,20 @@ func (v *v86VM) exec(ctx context.Context, cmd []string, in io.Reader, out, errOu
 }
 
 func (v *v86VM) stream(ctx context.Context, attach bool, cmd []string, in io.Reader, out, errOut io.Writer, tty bool, resize <-chan remotecommand.TerminalSize) error {
-	conn, err := v.dial(vmExecPort)
+	return streamVM(ctx, v.dial, attach, cmd, in, out, errOut, tty, resize)
+}
+
+// streamVM runs cmd in a VM, or attaches to its main process, over the exec
+// protocol of init: dial connects to a port of the VM. Docker containers use
+// it too (docker.go).
+func streamVM(ctx context.Context, dial func(int32) (net.Conn, error), attach bool, cmd []string, in io.Reader, out, errOut io.Writer, tty bool, resize <-chan remotecommand.TerminalSize) error {
+	return streamVMWith(ctx, dial, attach, cmd, in, out, errOut, tty, resize, nil)
+}
+
+// streamVMWith is streamVM with more fields for the request to init, such
+// as "detachable" for docker attach.
+func streamVMWith(ctx context.Context, dial func(int32) (net.Conn, error), attach bool, cmd []string, in io.Reader, out, errOut io.Writer, tty bool, resize <-chan remotecommand.TerminalSize, extra map[string]any) error {
+	conn, err := dial(vmExecPort)
 	if err != nil {
 		return fmt.Errorf("failed to connect to the container: %w", err)
 	}
@@ -65,6 +80,9 @@ func (v *v86VM) stream(ctx context.Context, attach bool, cmd []string, in io.Rea
 	}()
 
 	req := map[string]any{"cmd": cmd, "tty": tty, "stdin": in != nil, "attach": attach}
+	for k, v := range extra {
+		req[k] = v
+	}
 	if tty && resize != nil {
 		// kubectl sends the size of its terminal right away
 		select {
@@ -180,4 +198,46 @@ func execID() string {
 	b := make([]byte, 32)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// errNoSignal is the answer of an init that does not know signals: it took
+// the request for an exec without a command. The VM is older than the page.
+var errNoSignal = errors.New("the init of the VM cannot send signals")
+
+// signalVM sends sig to the main process of a VM, as runc kill does: init
+// answers with exit code 0 once the signal is sent (vm/init/init.c). The
+// process may exit later; init reports that on ttyS1 as usual.
+func signalVM(ctx context.Context, dial func(int32) (net.Conn, error), sig int) error {
+	conn, err := dial(vmExecPort)
+	if err != nil {
+		return fmt.Errorf("failed to connect to the container: %w", err)
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
+	line, _ := json.Marshal(map[string]int{"signal": sig})
+	if _, err := conn.Write(append(line, '\n')); err != nil {
+		return err
+	}
+	var h [5]byte
+	if _, err := io.ReadFull(conn, h[:]); err != nil {
+		return fmt.Errorf("the connection to the container broke: %w", err)
+	}
+	b := make([]byte, binary.BigEndian.Uint32(h[1:]))
+	if _, err := io.ReadFull(conn, b); err != nil {
+		return fmt.Errorf("the connection to the container broke: %w", err)
+	}
+	switch {
+	case h[0] == vmExit && len(b) == 4 && binary.BigEndian.Uint32(b) == 0:
+		return nil
+	case h[0] == vmError && string(b) == "exec: no command specified":
+		return errNoSignal
+	case h[0] == vmError:
+		return errors.New(string(b))
+	}
+	return fmt.Errorf("unexpected answer to a signal: frame %d", h[0])
 }

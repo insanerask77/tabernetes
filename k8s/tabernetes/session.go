@@ -33,6 +33,9 @@ type session struct {
 	nodeMu sync.Mutex
 	node   *tabNode
 	closed bool
+
+	vmMu      sync.Mutex
+	dockerVMs int // the Docker containers that run in the tab (docker.go)
 }
 
 var (
@@ -112,6 +115,8 @@ func (s *session) register() {
 	if _, err := s.startNode(ctx); err != nil {
 		s.status("this tab is no node: " + err.Error())
 	}
+	// containers with a restart policy come back with the page (docker.go)
+	dockerAutostart(s)
 }
 
 // startNode registers the node of the tab, once. After a failure, the next
@@ -142,6 +147,7 @@ func (s *session) close() {
 	sessionsMu.Unlock()
 	s.sh.stop()
 	s.jobs.stopAll()
+	dockerTabGone(s)
 	s.nodeMu.Lock()
 	s.closed = true
 	n := s.node

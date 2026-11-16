@@ -57,7 +57,7 @@ func proxyJS(a []js.Value) js.Value {
 		req.Header = header
 		resp, err := proxyClient.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("nothing answers on localhost:%d (kubectl port-forward ... %d:<pod port> &): %v", port, port, err)
+			return nil, fmt.Errorf("nothing answers on localhost:%d (kubectl port-forward ... %d:<pod port> & or docker run -p %d:<container port> ...): %v", port, port, port, err)
 		}
 		defer resp.Body.Close()
 		b, err := io.ReadAll(io.LimitReader(resp.Body, proxyMaxBody+1))

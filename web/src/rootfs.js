@@ -54,6 +54,39 @@ export class Tree {
     this.files.set(path, { ...entry, layer: this.layer });
   }
 
+  // resolve follows the symbolic links in the directories above path, as
+  // the kernel would: Docker mounts a volume at /var/run/x of an image
+  // where /var/run links to /run at /run/x.
+  resolve(path) {
+    let parts = clean(path).split("/").filter(Boolean);
+    for (let i = 0, hops = 0; i < parts.length - 1; i++) {
+      const p = parts.slice(0, i + 1).join("/");
+      const e = this.files.get(p);
+      if (!e || (e.mode & S_IFMT) !== S_IFLNK) continue;
+      if (++hops > 40) break; // ELOOP: leave it as it is
+      const base = e.target.startsWith("/") ? "" : parts.slice(0, i).join("/");
+      parts = clean(base + "/" + e.target + "/" + parts.slice(i + 1).join("/")).split("/").filter(Boolean);
+      i = -1;
+    }
+    return parts.join("/");
+  }
+
+  // take removes path and all below it and returns what it removed, by the
+  // path below path ("" is path itself). The directories above path stay or
+  // are made: a mount goes there (volumes.js).
+  take(path) {
+    path = clean(path);
+    const out = new Map();
+    const prefix = path + "/";
+    for (const [k, v] of this.files) {
+      if (k === path) out.set("", v);
+      else if (k.startsWith(prefix)) out.set(k.slice(prefix.length), v);
+    }
+    this.#remove(path);
+    this.#parents(path);
+    return out;
+  }
+
   // addLayer applies one layer: the entries of its index (layers.js), the
   // data of a file is at offset in the layer with the id.
   addLayer(id, entries) {
@@ -123,6 +156,24 @@ export class Tree {
       parent.push([name, size, e.mtime, e.mode, e.uid, e.gid, x]);
     }
     return { version: 3, size: total, fsroot };
+  }
+}
+
+// addWorkingDir adds the working directory of a container to the tree if
+// the image does not have it: runc and Docker create it (root, 0755), so
+// docker run -w /new/dir works. A path through a symbolic link or a file is
+// left alone; init then fails on it as runc would.
+export function addWorkingDir(tree, cwd, mtime = 0) {
+  const path = clean(cwd || "");
+  if (!path) return;
+  const parts = path.split("/");
+  for (let i = 1; i <= parts.length; i++) {
+    const e = tree.files.get(parts.slice(0, i).join("/"));
+    if (!e) {
+      tree.set(path, { uid: 0, gid: 0, mtime, mode: S_IFDIR | 0o755 });
+      return;
+    }
+    if ((e.mode & S_IFMT) !== S_IFDIR) return;
   }
 }
 
