@@ -10,16 +10,19 @@
 # tabernetes container sends /v2/ to the registry on port 5000. Same domain
 # means no CORS, so no extra nginx is needed.
 #
-# The images are on ghcr.io (the CI of insanerask77/tabernetes builds them).
-# While the packages are private, log in once before the first up with a
-# token that can read packages:
-#   docker login ghcr.io -u insanerask77
+# The images are public on ghcr.io (the CI of insanerask77/tabernetes builds
+# them on every release). Watchtower pulls a new site image within five
+# minutes of a release and recreates the container, so a release deploys
+# itself.
 
 services:
   tabernetes:
     image: ghcr.io/insanerask77/tabernetes-site:latest
     container_name: tabernetes
     restart: unless-stopped
+    labels:
+      # Only containers with this label are updated by Watchtower.
+      com.centurylinklabs.watchtower.enable: "true"
     environment:
       # Where the browser pulls images from: this same site (/v2/ goes to the
       # registry). It is written into index.html on the first start, so after
@@ -57,6 +60,22 @@ services:
     volumes:
       # Keep the cached images when the container is recreated.
       - registry-data:/var/lib/registry
+
+  # Updates the tabernetes container when a new image is on ghcr.io. It
+  # touches only containers with the label above, not the rest of the server.
+  # The fork of nicholas-fedor, because containrrr/watchtower is archived and
+  # its Docker client is too old for Docker 29.
+  watchtower:
+    image: ghcr.io/nicholas-fedor/watchtower:latest
+    container_name: tabernetes-watchtower
+    restart: unless-stopped
+    environment:
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_POLL_INTERVAL: "300"
+      # Delete the old image after an update.
+      WATCHTOWER_CLEANUP: "true"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
 
 volumes:
   registry-data:

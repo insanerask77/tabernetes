@@ -15,7 +15,9 @@ docker run --rm -p 8080:80 ghcr.io/insanerask77/tabernetes-site:latest
 
 `ghcr.io/insanerask77/tabernetes-site:<version>` holds the page of that
 release, and its `join` prints `ghcr.io/insanerask77/tabernetes:<version>`.
-While the packages are private, `docker login ghcr.io` first.
+Both packages are public, so no login is needed. In
+[docker-compose.yml](../docker-compose.yml), Watchtower pulls the site image
+of a new release within five minutes and recreates the container.
 
 ## Build
 

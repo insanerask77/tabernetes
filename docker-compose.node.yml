@@ -20,7 +20,7 @@
 #
 # The image is on ghcr.io (the CI of insanerask77/tabernetes builds it). Use
 # the version of the page (`join` prints it) instead of latest when they
-# differ. While the package is private, run `docker login ghcr.io` first.
+# differ. The package is public, so no login is needed.
 
 services:
   node:
