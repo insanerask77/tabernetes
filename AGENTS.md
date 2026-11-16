@@ -248,6 +248,39 @@ that name.
   Kubernetes minor version, or one that fails to boot, is dropped. `forget`
   keeps the layers of running pods with a `<digest>.forgotten` mark; page
   load and image GC sweep them later.
+- **Docker in the tab** (2026-11-13, `docs/docker-in-wasm.md` and
+  `docs/docker-in-wasm-status.md`): containerd compiled to wasm runs in the
+  worker (`core/runtime/v2/v86/daemon` in `k8s/containerd-js.patch`), one
+  v86 VM per task through an in-process shim, and a Docker Engine API on
+  127.0.0.1:2375 for the `docker` builtin. It starts with the first
+  `docker` command, not at boot. Attach output comes from the console log
+  (the VM starts the process before any attach); stdin, resize, exec and
+  signals go over the exec protocol of init.
+- **Signals** (`vm/init/init.c`, `signalVM` in `k8s/tabernetes/v86exec.go`):
+  docker stop and kill, and a deleted pod, send `{"signal": N}` to the exec
+  port of init. Init signals the main process only, as tini
+  (`docker run --init`) does, so `sleep` ends with 143 on SIGTERM. SIGKILL
+  is `kill(-1, SIGKILL)`: everything but init dies at once. Never use the
+  `syscall.SIG*` constants of js/wasm for the VM: there SIGKILL is 3 and
+  SIGTERM is 6. Use `v86.SIGKILL`, `v86.SIGTERM` and `v86.ParseSignal`. The
+  child of init resets SIGPIPE before exec. A stop takes at least 2 s on the
+  tab node (the kubelet's minimum); keep it.
+- **Docker survives the page**: containerd's root, state and the container
+  logs are kept files (`keptPaths` in `fs.js`), saved in 64 KiB chunks so
+  that bbolt and logs write only what changed. The shim keeps the exit of
+  each task in its bundle (`v86-state.json`); a restarted containerd loads
+  the in-process shims, which report old tasks as stopped (255 if they
+  still ran, 137 for a closed tab). The 8 places of a tab are shared by pods
+  and Docker containers: allocatable pods drop by the running containers.
+- **Docker container ids are random, names are labels**
+  (`dev.tabernetes.docker.name`): never use the containerd id as a name in
+  messages or links. The run state lives in labels; the API deletes a task
+  when it ends, so code that waits on a task must accept "not found".
+- **Go's HTTP server and Hijack**: after `Hijack`, the buffered reader still
+  reads through the server and cancels the request context on EOF (the
+  client's half-close at the end of stdin). Read the buffered bytes, then
+  the connection, and use a context that does not come from the request
+  (`dockerapi/stream.go`).
 
 ## Hosting and network constraints
 
