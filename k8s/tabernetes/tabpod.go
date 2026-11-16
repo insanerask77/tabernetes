@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/containerd/containerd/v2/core/runtime/v2/v86"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,6 +40,15 @@ type workload interface {
 type exiter interface {
 	// wait returns the exit code once the workload has ended.
 	wait() <-chan int
+}
+
+// signaler is a workload whose main process takes signals, so that it can
+// stop gracefully.
+type signaler interface {
+	// signal sends sig to the main process; it returns once it is sent.
+	signal(ctx context.Context, sig int) error
+	// stopSignal is the STOPSIGNAL of the image, or "".
+	stopSignal() string
 }
 
 // startError is a container that did not start, as runc reports it.
@@ -87,6 +97,10 @@ type tabPod struct {
 	message string
 	started metav1.Time
 	push    sync.Mutex // one status update at a time
+
+	terminating bool          // the pod is deleted: no restart (under mu)
+	termOnce    sync.Once     // one termination
+	runDone     chan struct{} // closed when run returns
 }
 
 func (n *tabNode) newPod(pod *corev1.Pod) *tabPod {
@@ -104,6 +118,7 @@ func (n *tabNode) newPod(pod *corev1.Pod) *tabPod {
 		cancel:        cancel,
 		phase:         corev1.PodPending,
 		started:       metav1.Now(),
+		runDone:       make(chan struct{}),
 	}
 	if pod.Spec.HostNetwork {
 		tp.ip = n.ip
@@ -169,10 +184,13 @@ func (tp *tabPod) event(typ, reason, msg string) {
 // run starts the workload and restarts it after a failure, with the same
 // back-off as the kubelet.
 func (tp *tabPod) run() {
+	defer close(tp.runDone)
 	ctx := tp.ctx
 	tp.update()
 	if tp.phase == corev1.PodFailed {
-		tp.event(corev1.EventTypeWarning, tp.reason, tp.message)
+		// the kubelet's event of a rejected pod has the message without
+		// the prefix of the status
+		tp.event(corev1.EventTypeWarning, tp.reason, strings.TrimPrefix(tp.message, "Pod was rejected: "))
 		return
 	}
 	if len(tp.ignored) > 0 {
@@ -261,6 +279,16 @@ func (tp *tabPod) run() {
 		var code int
 		select {
 		case <-ctx.Done():
+			// stop took the workload, unless it came before setRunning
+			tp.mu.Lock()
+			mine := tp.w == w
+			if mine {
+				tp.w = nil
+			}
+			tp.mu.Unlock()
+			if mine {
+				w.stop()
+			}
 			return
 		case code = <-e.wait():
 		}
@@ -292,6 +320,12 @@ func (tp *tabPod) run() {
 // restarts tells whether the restart policy starts the container again
 // after it exited with code.
 func (tp *tabPod) restarts(code int) bool {
+	tp.mu.Lock()
+	terminating := tp.terminating
+	tp.mu.Unlock()
+	if terminating {
+		return false
+	}
 	switch tp.restartPolicy {
 	case corev1.RestartPolicyNever:
 		return false
@@ -366,6 +400,78 @@ func (p *imagePull) wasPulled() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.pulled
+}
+
+// minimumGracePeriod is the shortest time that the kubelet gives a
+// container to stop (minimumGracePeriodInSeconds in pkg/kubelet/kuberuntime).
+const minimumGracePeriod = 2 * time.Second
+
+// killWait is how long terminate waits for the exit after SIGKILL before it
+// ends the VM.
+var killWait = 5 * time.Second
+
+// terminate stops the container of a deleted pod as the kubelet does
+// (killContainer in pkg/kubelet/kuberuntime, StopContainer of containerd's
+// CRI): the stop signal, up to grace for the exit, then SIGKILL. The exit
+// code is the one of the process, so a pod that handles SIGTERM ends with
+// 0, one that does not with 143. It runs once; it reports whether this call
+// did the work.
+func (tp *tabPod) terminate(grace time.Duration) (first bool) {
+	tp.termOnce.Do(func() {
+		first = true
+		tp.kill(max(grace, minimumGracePeriod))
+	})
+	return first
+}
+
+func (tp *tabPod) kill(grace time.Duration) {
+	tp.mu.Lock()
+	tp.terminating = true
+	w := tp.w
+	tp.mu.Unlock()
+	if w == nil {
+		tp.stop("", "")
+		return
+	}
+	tp.event(corev1.EventTypeNormal, "Killing", "Stopping container "+tp.container.Name)
+	if s, ok := w.(signaler); ok {
+		ctx := context.Background()
+		exited := func(d time.Duration) bool {
+			t := time.NewTimer(d)
+			defer t.Stop()
+			select {
+			case <-tp.runDone: // run saw the exit and recorded it
+				return true
+			case <-t.C:
+				return false
+			}
+		}
+		if err := s.signal(ctx, tp.stopSignal(s)); err == nil && exited(grace) {
+			tp.stop("", "")
+			return
+		}
+		if err := s.signal(ctx, v86.SIGKILL); err == nil {
+			exited(killWait)
+		}
+	}
+	tp.stop("", "")
+}
+
+// stopSignal is the signal that stops the container: lifecycle.stopSignal
+// of the container, else the STOPSIGNAL of the image, else SIGTERM, as
+// containerd's CRI picks it.
+func (tp *tabPod) stopSignal(s signaler) int {
+	name := s.stopSignal()
+	if l := tp.container.Lifecycle; l != nil && l.StopSignal != nil {
+		name = string(*l.StopSignal)
+	}
+	if name != "" {
+		if n, err := v86.ParseSignal(name); err == nil {
+			return int(n)
+		}
+		fmt.Fprintf(os.Stderr, "tab node: pod %s/%s: invalid stop signal %q, using SIGTERM\n", tp.namespace, tp.name, name)
+	}
+	return v86.SIGTERM
 }
 
 // stop ends the workload. With a reason, it tells the pod's events.
@@ -458,9 +564,10 @@ func (tp *tabPod) update() {
 		s := &pod.Status
 		s.Phase, s.Reason, s.Message = phase, reason, message
 		s.HostIP, s.HostIPs = tp.n.ip, []corev1.HostIP{{IP: tp.n.ip}}
-		s.PodIP, s.PodIPs = tp.ip, []corev1.PodIP{{IP: tp.ip}}
 		s.StartTime = &tp.started
+		// a pod the tab rejected or cannot run never got a network
 		if phase != corev1.PodFailed || reason == "" {
+			s.PodIP, s.PodIPs = tp.ip, []corev1.PodIP{{IP: tp.ip}}
 			s.ContainerStatuses = []corev1.ContainerStatus{cs}
 		}
 		ready := corev1.ConditionFalse

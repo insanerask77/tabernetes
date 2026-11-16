@@ -7,9 +7,41 @@
 // (bridge.js), since a shared worker cannot start workers.
 export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, registry, spawn = (u) => new Worker(u) }) {
   const abs = (u) => new URL(u, location.href).href;
+  // ask sends one request to a worker of its own, which starts no VM, and
+  // resolves with the answer of type done. Docker uses it for pull, images
+  // and rmi; the worker ends with the answer (it holds the layers of a pull
+  // in use until then).
+  const ask = (msg, done, onMessage = () => {}) => new Promise((resolve, reject) => {
+    const worker = spawn(abs(workerURL));
+    const end = () => worker.terminate();
+    worker.onmessage = ({ data: m }) => {
+      if (m.type === done) { end(); resolve(m); }
+      else if (m.type === "error") { end(); reject(new Error(m.message)); }
+      else onMessage(m);
+    };
+    worker.onerror = (e) => { e.preventDefault(); end(); reject(new Error(e.message || "the VM worker failed")); };
+    worker.postMessage({ ...msg, registry, version });
+  });
   return {
     version, // of v86, for the container runtime of the node
     registry,
+
+    // pull pulls an image without starting it (docker pull). progress(step)
+    // gets {layer, status, current, total}. It resolves with {image,
+    // downloaded}; image is described in dockerapi/images.go (Image).
+    pull(image, progress) {
+      return ask({ type: "pull", image }, "pulled", (m) => { if (m.type === "progress") progress(m); })
+        .then((m) => JSON.stringify({ image: m.image, downloaded: m.downloaded }));
+    },
+    // images lists the images of the browser (docker images), as JSON.
+    images() {
+      return ask({ type: "images" }, "images").then((m) => JSON.stringify(m.images));
+    },
+    // removeImage forgets a reference (docker rmi) and resolves with the
+    // digests it deleted, as JSON.
+    removeImage(image) {
+      return ask({ type: "rmi", image }, "removed").then((m) => JSON.stringify(m.deleted));
+    },
 
     // start pulls the image and boots it. opts: image, container (command,
     // args, env as "NAME=value", workingDir), hostname, ip, gateway, memory

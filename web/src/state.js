@@ -5,7 +5,9 @@
 //                  and, after the last tab closed, the hibernated control
 //                  plane (hibernate.js, ~40 MB)
 //   /root          IndexedDB "tabernetes", store "home": a record per file of
-//                  the terminal (fs.js)
+//                  the terminal (fs.js), and per 64 KiB of a bigger file
+//   Docker         the same store: the data and state of containerd and the
+//                  consoles of the containers (keptPaths in fs.js)
 //   the images     OPFS tabernetes/layers (layers.js), their configs in the
 //                  cache "tabernetes-configs" (vmworker.js), and the models
 //                  of llm pods in the caches of WebLLM
@@ -131,12 +133,26 @@ export async function dropHibernated() {
   await tx("cluster", "readwrite", (s) => s.delete("hibernated")).catch(() => {});
 }
 
-// loadHome returns the records of the files in /root:
-// {path, mode, mtime, data?: Uint8Array, target?: string}, parents first.
+// The key of a record of fs.js: its path, and for a chunk of a big file
+// the path, a NUL and the number of the chunk with leading zeros, so that
+// the chunks of a file sort together and in order, and a range of keys
+// holds those from a number on.
+export const homeKey = (r) => (r.chunk == null ? r.path : chunkKey(r.path, r.chunk));
+const chunkKey = (path, i) => path + "\0" + String(i).padStart(8, "0");
+const chunksFrom = (path, i) => IDBKeyRange.bound(chunkKey(path, i), path + "\0\uffff");
+
+// sortHome puts the records in the order fs.js restores them: parents
+// first, a file before its chunks.
+export function sortHome(all) {
+  return all.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : (a.chunk ?? -1) - (b.chunk ?? -1)));
+}
+
+// loadHome returns the records of the kept files (fs.js):
+// {path, mode, mtime, data?: Uint8Array, target?: string, size?, chunks?}
+// and {path, chunk, data} for the chunks of a big file, in sortHome order.
 export async function loadHome() {
   try {
-    const all = await tx("home", "readonly", (s) => s.getAll());
-    return all.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    return sortHome(await tx("home", "readonly", (s) => s.getAll()));
   } catch (e) {
     console.warn("tabernetes: no saved files:", e);
     return [];
@@ -144,16 +160,23 @@ export async function loadHome() {
 }
 
 // saveHome writes the records of changed files and deletes the paths of
-// removed ones, with everything below them.
+// removed ones, with everything below them and their chunks. A file record
+// says how many chunks the file has now: the ones after go.
 export async function saveHome(put, del) {
   if (forgotten) return;
-  await tx("home", "readwrite", (s) => {
-    for (const p of del) {
-      s.delete(p);
-      s.delete(IDBKeyRange.bound(p + "/", p + "/￿"));
-    }
-    for (const r of put) s.put(r, r.path);
-  });
+  await tx("home", "readwrite", (s) => applyHome(s, put, del));
+}
+
+// applyHome does the work of saveHome in the object store s (exported for
+// the tests).
+export function applyHome(s, put, del) {
+  for (const p of del) {
+    s.delete(p);
+    s.delete(IDBKeyRange.bound(p + "/", p + "/\uffff"));
+    s.delete(chunksFrom(p, 0));
+  }
+  for (const r of put) if (r.chunks != null) s.delete(chunksFrom(r.path, r.chunks));
+  for (const r of put) s.put(r, homeKey(r));
 }
 
 // keepStorage asks the browser to keep what Tabernetes saved. Without it the

@@ -261,3 +261,60 @@ test("exit code of the main process", { skip: !linux }, async (t) => {
   await until(() => vm.lines.length >= 2);
   assert.deepEqual(vm.lines, ["started", "exit 7"]);
 });
+
+// docker stop and kill, and a deleted pod: {"signal": N} goes to the main
+// process (k8s/tabernetes/v86exec.go signalVM).
+test("signals", { skip: !linux }, async (t) => {
+  await t.test("SIGTERM ends the main process with 143", async (t) => {
+    const vm = await start({ args: ["sleep", "1000"] });
+    t.after(vm.stop);
+    const s = await run(vm, { signal: 15 });
+    assert.deepEqual([s.exit, s.error], [0, null]);
+    await until(() => vm.lines.length >= 2);
+    assert.deepEqual(vm.lines, ["started", "exit 143"]);
+    // the main process is gone: a further signal fails
+    const again = await run(vm, { signal: 15 });
+    assert.equal(again.error, "container not running");
+  });
+
+  await t.test("a main process that ignores SIGTERM lives on until SIGKILL", async (t) => {
+    const vm = await start({ args: ["sh", "-c", "trap '' TERM; sleep 1000 & wait; wait"] });
+    t.after(vm.stop);
+    await run(vm, { signal: 15 });
+    await sleep(300);
+    assert.deepEqual(vm.lines, ["started"]);
+    const t0 = Date.now();
+    const s = await run(vm, { signal: 9 });
+    assert.equal(s.exit, 0);
+    await until(() => vm.lines.length >= 2);
+    assert.deepEqual(vm.lines, ["started", "exit 137"]);
+    // SIGKILL took the child with it, so the output did not keep init waiting
+    assert.ok(Date.now() - t0 < 900, `${Date.now() - t0} ms`);
+  });
+
+  await t.test("a handled signal reaches the main process and keeps it running", async (t) => {
+    const vm = await start({ args: ["sh", "-c", "trap 'echo reload' HUP; while :; do sleep 0.05; done"], stdin: true });
+    t.after(vm.stop);
+    const a = await session(vm, { attach: true });
+    await sleep(100);
+    await run(vm, { signal: 1 });
+    await a.wait((s) => s.out.includes("reload"));
+    assert.deepEqual(vm.lines, ["started"]);
+    a.c.destroy();
+  });
+
+  await t.test("invalid signals", async (t) => {
+    const vm = await start({ args: ["sleep", "1000"] });
+    t.after(vm.stop);
+    const s = await run(vm, { signal: 99 });
+    assert.equal(s.error, "invalid signal 99");
+    assert.deepEqual(vm.lines, ["started"]);
+  });
+
+  await t.test("the container does not inherit the ignored SIGPIPE of init", async (t) => {
+    const vm = await start({ args: ["sleep", "1000"] });
+    t.after(vm.stop);
+    const s = await run(vm, { cmd: ["grep", "SigIgn", "/proc/self/status"] });
+    assert.match(s.out, /^SigIgn:\s+0+\n$/);
+  });
+});

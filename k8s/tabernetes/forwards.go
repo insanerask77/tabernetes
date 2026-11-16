@@ -11,7 +11,8 @@ import (
 )
 
 // The ports of "kubectl port-forward" while they listen. The page shows each
-// one as a link under the terminal that opens it like "proxy <port>".
+// one as a link under the terminal that opens it like "proxy <port>". The
+// published ports of Docker containers join the list (dockerports.go).
 
 type forward struct {
 	port   uint16

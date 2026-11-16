@@ -352,6 +352,23 @@ class OPFSStore {
     });
   }
 
+  // size returns the size of an unpacked layer, or null if it is not
+  // there (docker images).
+  async size(digest) {
+    try {
+      await this.dir.getFileHandle(fileName(digest) + ".json");
+      return (await (await this.dir.getFileHandle(fileName(digest) + ".tar")).getFile()).size;
+    } catch {
+      return null;
+    }
+  }
+
+  // remove deletes a layer unless a pod runs with it or a pull unpacks it
+  // (docker rmi). It tells whether the layer went.
+  async remove(digest) {
+    return removeLayer(this.dir, fileName(digest));
+  }
+
   // layer is the reader of the tar of an unpacked layer.
   async layer(digest) {
     const file = await (await this.dir.getFileHandle(fileName(digest) + ".tar")).getFile();
@@ -385,6 +402,14 @@ class MemoryStore {
     this.tars.set(digest, tar);
     this.indexes.set(digest, idx);
     return idx;
+  }
+
+  async size(digest) {
+    return this.indexes.get(digest)?.size ?? null;
+  }
+
+  async remove(digest) {
+    return this.tars.delete(digest) && this.indexes.delete(digest);
   }
 
   async layer(digest) {

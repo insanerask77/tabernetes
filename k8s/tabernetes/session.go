@@ -33,6 +33,9 @@ type session struct {
 	nodeMu sync.Mutex
 	node   *tabNode
 	closed bool
+
+	vmMu      sync.Mutex
+	dockerVMs int // the Docker containers that run in the tab (docker.go)
 }
 
 var (
@@ -142,6 +145,7 @@ func (s *session) close() {
 	sessionsMu.Unlock()
 	s.sh.stop()
 	s.jobs.stopAll()
+	dockerTabGone(s)
 	s.nodeMu.Lock()
 	s.closed = true
 	n := s.node

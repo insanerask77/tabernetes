@@ -23,7 +23,9 @@
 // kubectl exec and attach come in over the network: the kubelet connects to
 // port 60250 and sends one line of JSON (k8s/tabernetes/v86exec.go). After
 // that, both sides send frames: one byte type, four bytes big-endian length,
-// the payload.
+// the payload. A request {"signal": N} sends signal N to the main process
+// instead, for docker stop and kill and for a pod that is deleted
+// (signal_main).
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -635,6 +637,9 @@ static int proc_start(proc_t *p, const char *path, char **argv, int tty, int wit
     sigset_t all;
     sigemptyset(&all);
     sigprocmask(SIG_SETMASK, &all, NULL);
+    // init ignores SIGPIPE, and exec keeps what is ignored: a container
+    // gets the default, as with runc
+    signal(SIGPIPE, SIG_DFL);
     setsid();
     // in the tests on the host, init is not PID 1: its children must not
     // outlive it
@@ -837,6 +842,7 @@ static void session_frame(session_t *s, int type, const char *b, uint32_t n) {
 typedef struct {
   strv_t cmd;
   int tty, stdin_, attach, rows, cols;
+  int has_signal, signal;
 } request_t;
 
 static void request_field(json_t *j, const char *k, void *arg) {
@@ -847,7 +853,28 @@ static void request_field(json_t *j, const char *k, void *arg) {
   else if (!strcmp(k, "attach")) r->attach = js_bool(j);
   else if (!strcmp(k, "rows")) r->rows = js_number(j);
   else if (!strcmp(k, "cols")) r->cols = js_number(j);
+  else if (!strcmp(k, "signal")) r->has_signal = 1, r->signal = js_number(j);
   else js_skip(j);
+}
+
+// signal_main sends sig to the main process, as runc kill does to the
+// init of a container. In Docker and Kubernetes the main process is PID 1 of
+// its PID namespace; here init is PID 1 and the main process is its child.
+// Other signals go to the main process alone, so a shell that ignores
+// SIGTERM keeps its children, as in a container. SIGKILL ends every process
+// but init, as the end of a PID namespace does: then nothing holds the
+// output open and init reports "exit 137" at once.
+static int signal_main(int sig) {
+  if (!main_started || main_proc.done) return fail("container not running");
+  if (sig < 0 || sig >= 65) return fail("invalid signal %d", sig);
+  int rc;
+  // On the host (vm/test) kill(-1) would hit every process of the user:
+  // there, the process group of the main process stands in for the VM.
+  if (sig == SIGKILL && !test_config) rc = kill(-1, SIGKILL);
+  else if (sig == SIGKILL) rc = kill(-main_proc.pid, SIGKILL);
+  else rc = kill(main_proc.pid, sig);
+  if (rc < 0) return fail("kill: %s", errtext(errno));
+  return 0;
 }
 
 static void session_request(session_t *s, const char *line, size_t n) {
@@ -855,6 +882,16 @@ static void session_request(session_t *s, const char *line, size_t n) {
   json_t j = {line, line + n, 0};
   if (js_object(&j, request_field, &r) < 0) {
     frame_error(s, "invalid request");
+    goto out;
+  }
+  if (r.has_signal) {
+    // the answer: exit code 0 once the signal is sent, else an error
+    if (signal_main(r.signal) < 0) {
+      frame_error(s, err_msg);
+      goto out;
+    }
+    frame_code(s, 0);
+    s->closing = 1;
     goto out;
   }
   if (r.attach) {

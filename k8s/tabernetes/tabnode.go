@@ -108,6 +108,7 @@ type tabNode struct {
 
 	stop     chan struct{} // closed when the tab is gone
 	shutdown func()        // the kubelet API and the event recorder
+	kick     chan struct{} // allocatableChanged
 }
 
 func newTabNode(ctx context.Context, name, ip string, host js.Value) (*tabNode, error) {
@@ -143,6 +144,7 @@ func newTabNode(ctx context.Context, name, ip string, host js.Value) (*tabNode, 
 		pods:   map[types.UID]*tabPod{},
 		events: make(chan tabEvent, 256),
 		stop:   make(chan struct{}),
+		kick:   make(chan struct{}, 1),
 	}
 	closeKubelet, err := n.serveKubelet()
 	if err != nil {
@@ -160,6 +162,7 @@ func newTabNode(ctx context.Context, name, ip string, host js.Value) (*tabNode, 
 	}
 	go n.recordEvents()
 	go n.heartbeat()
+	go n.writeAllocatable()
 	n.watchPods()
 	return n, nil
 }
@@ -187,7 +190,7 @@ func (n *tabNode) node() *corev1.Node {
 	capacity := corev1.ResourceList{
 		corev1.ResourceCPU:    *resource.NewQuantity(int64(max(cpus, 1)), resource.DecimalSI),
 		corev1.ResourceMemory: *resource.NewQuantity(int64(mem)<<30, resource.BinarySI),
-		corev1.ResourcePods:   *resource.NewQuantity(8, resource.DecimalSI),
+		corev1.ResourcePods:   *resource.NewQuantity(maxTabVMs, resource.DecimalSI),
 		webgpuResource:        *resource.NewQuantity(0, resource.DecimalSI),
 	}
 	runtime := n.vmRuntime()
@@ -204,6 +207,10 @@ func (n *tabNode) node() *corev1.Node {
 	cond := func(t corev1.NodeConditionType, s corev1.ConditionStatus, reason, msg string) corev1.NodeCondition {
 		return corev1.NodeCondition{Type: t, Status: s, Reason: reason, Message: msg, LastHeartbeatTime: now, LastTransitionTime: now}
 	}
+	// The Docker containers of the tab take places of pods, as a reserve
+	// for the system (--system-reserved) does on a real node.
+	allocatable := capacity.DeepCopy()
+	allocatable[corev1.ResourcePods] = *resource.NewQuantity(int64(n.allocatablePods()), resource.DecimalSI)
 	return &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: n.name,
@@ -221,7 +228,7 @@ func (n *tabNode) node() *corev1.Node {
 		},
 		Status: corev1.NodeStatus{
 			Capacity:    capacity,
-			Allocatable: capacity,
+			Allocatable: allocatable,
 			Conditions: []corev1.NodeCondition{
 				cond(corev1.NodeMemoryPressure, corev1.ConditionFalse, "KubeletHasSufficientMemory", "kubelet has sufficient memory available"),
 				cond(corev1.NodeDiskPressure, corev1.ConditionFalse, "KubeletHasNoDiskPressure", "kubelet has no disk pressure"),
@@ -392,11 +399,66 @@ func (n *tabNode) watchPods() {
 	f.Start(n.stop)
 }
 
+// allocatablePods is the number of pods the node takes: the places of the
+// tab that its Docker containers do not use (admitContainer).
+func (n *tabNode) allocatablePods() int {
+	return max(maxTabVMs-dockerVMsOf(n.name), 0)
+}
+
+// activePods is the number of pods that run or will run. Pods that ended
+// do not count, as for the kubelet. n.mu is held.
+func (n *tabNode) activePods() int {
+	active := 0
+	for _, tp := range n.pods {
+		tp.mu.Lock()
+		if tp.phase != corev1.PodSucceeded && tp.phase != corev1.PodFailed {
+			active++
+		}
+		tp.mu.Unlock()
+	}
+	return active
+}
+
+// allocatableChanged writes the node status soon: a Docker container took
+// a place of the tab or gave it back. It never blocks.
+func (n *tabNode) allocatableChanged() {
+	select {
+	case n.kick <- struct{}{}:
+	default:
+	}
+}
+
+func (n *tabNode) writeAllocatable() {
+	for {
+		select {
+		case <-n.kick:
+		case <-n.stop:
+			return
+		}
+		// one write for the containers that start or end together
+		time.Sleep(200 * time.Millisecond)
+		select {
+		case <-n.kick:
+		default:
+		}
+		if err := n.updateStatus(context.Background()); err != nil && !apierrors.IsNotFound(err) {
+			fmt.Fprintln(os.Stderr, "tab node: status:", err)
+		}
+	}
+}
+
 func (n *tabNode) sync(pod *corev1.Pod) {
 	n.mu.Lock()
 	tp := n.pods[pod.UID]
 	if tp == nil && pod.DeletionTimestamp == nil && pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
 		tp = n.newPod(pod)
+		// The admission of the kubelet: the scheduler sees the places that
+		// Docker containers take only with the next node status, and a pod
+		// with spec.nodeName set does not ask the scheduler at all.
+		if used, allocatable := n.activePods(), n.allocatablePods(); tp.phase != corev1.PodFailed && used >= allocatable {
+			tp.phase, tp.reason = corev1.PodFailed, "OutOfpods"
+			tp.message = fmt.Sprintf("Pod was rejected: Node didn't have enough resource: pods, requested: 1, used: %d, capacity: %d", used, allocatable)
+		}
 		n.pods[pod.UID] = tp
 		go tp.run()
 	}
@@ -407,10 +469,11 @@ func (n *tabNode) sync(pod *corev1.Pod) {
 }
 
 // terminate stops the pod and removes it, as the kubelet does once the
-// containers are gone.
+// containers are gone. Every update of a deleted pod calls it: only the
+// first call stops the pod and removes it.
 func (n *tabNode) terminate(pod *corev1.Pod, tp *tabPod) {
-	if tp != nil {
-		tp.stop("Killing", "Stopping container "+tp.container.Name)
+	if tp != nil && !tp.terminate(gracePeriod(pod)) {
+		return
 	}
 	err := n.cs.CoreV1().Pods(pod.Namespace).Delete(context.Background(), pod.Name, metav1.DeleteOptions{
 		GracePeriodSeconds: ptr.To(int64(0)),
@@ -421,13 +484,30 @@ func (n *tabNode) terminate(pod *corev1.Pod, tp *tabPod) {
 	}
 }
 
+// gracePeriod is the time that a deleted pod has to stop, as the kubelet
+// reads it (setTerminationGracePeriod in pkg/kubelet/kuberuntime): what the
+// delete asked for, else terminationGracePeriodSeconds. The API server
+// fills in both, so the last default is only for safety.
+func gracePeriod(pod *corev1.Pod) time.Duration {
+	switch {
+	case pod.DeletionGracePeriodSeconds != nil:
+		return time.Duration(*pod.DeletionGracePeriodSeconds) * time.Second
+	case pod.Spec.TerminationGracePeriodSeconds != nil:
+		return time.Duration(*pod.Spec.TerminationGracePeriodSeconds) * time.Second
+	}
+	return minimumGracePeriod
+}
+
+// forget stops a pod that is gone from the API. After a normal delete,
+// terminate stopped it already; a pod deleted with --force still gets the
+// shortest grace period, as from the kubelet.
 func (n *tabNode) forget(uid types.UID) {
 	n.mu.Lock()
 	tp := n.pods[uid]
 	delete(n.pods, uid)
 	n.mu.Unlock()
 	if tp != nil {
-		tp.stop("", "")
+		go tp.terminate(0)
 	}
 }
 

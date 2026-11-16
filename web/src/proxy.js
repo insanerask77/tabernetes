@@ -75,8 +75,8 @@ export function proxyBuiltins({ worker = "/tabernetes-proxy/sw.js", scope = "/ta
     return tab;
   }
 
-  // The status line links every port of "kubectl port-forward" while it
-  // listens. Go calls this when the list changes (tabernetes/forwards.go).
+  // The status line links every port of "kubectl port-forward" and
+  // "docker run -p" while it listens. Go calls this when the list changes (tabernetes/forwards.go).
   let render = 0;
   globalThis.tabernetesForwards = async (list) => {
     if (!status) return;
@@ -98,7 +98,7 @@ export function proxyBuiltins({ worker = "/tabernetes-proxy/sw.js", scope = "/ta
       a.href = urlOf(port);
       a.target = "_blank";
       a.textContent = label;
-      a.title = `Open localhost:${port} of this tab in a new tab (kubectl port-forward to ${target})`;
+      a.title = `Open localhost:${port} of this tab in a new tab (forwarded to ${target})`;
       a.addEventListener("click", (e) => {
         e.preventDefault();
         openTab(port).catch((err) => console.error("tabernetes proxy:", err));

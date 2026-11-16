@@ -121,10 +121,11 @@ class Pull {
   }
 
   // layer streams the blob of a layer and hashes it on the way. verify()
-  // throws once the stream ended when the digest is wrong.
-  layer(digest) {
+  // throws once the stream ended when the digest is wrong. onBytes(n, end)
+  // gets the bytes that came so far, and end once all of them are there.
+  layer(digest, onBytes = () => {}) {
     const hash = new SHA256();
-    let got = "";
+    let got = "", read = 0;
     const fetchLayer = async () => {
       const r = await fetch(`${this.base}/blobs/${digest}`).catch((e) => {
         throw new PullError(`failed to copy: httpReadSeeker: failed open: ${e.message} (registry mirror unreachable)`);
@@ -143,11 +144,14 @@ class Pull {
           }
           if (chunk.done) {
             got = "sha256:" + hash.hex();
+            onBytes(read, true);
             c.close();
             return;
           }
           hash.update(chunk.value);
           this.fetched += chunk.value.length;
+          read += chunk.value.length;
+          onBytes(read, false);
           c.enqueue(chunk.value);
         },
         cancel: (why) => body.cancel(why),
@@ -178,8 +182,9 @@ let store; // the image store (layers.js), once per worker
 // pullImage pulls an image, or finds it present. policy is the
 // imagePullPolicy of the container: with IfNotPresent and Never, an image
 // that a pull of the same reference left complete is used without asking
-// the registry, as the kubelet does.
-async function pullImage(registry, image, policy, onFetching) {
+// the registry, as the kubelet does. progress(layer, status, current, total)
+// follows the layers, for docker pull (pullProgress).
+async function pullImage(registry, image, policy, onFetching, progress = null) {
   const ref = parseRef(image);
   if (ref.domain !== "docker.io") {
     throw new PullError(`failed to resolve reference "${ref.name}": the tab node pulls from Docker Hub only (through the registry mirror of this page)`);
@@ -194,16 +199,21 @@ async function pullImage(registry, image, policy, onFetching) {
   }
   let { digest, json: m } = await p.manifest(ref.reference, [...INDEX_TYPES, ...MANIFEST_TYPES]);
   const imageID = `${ref.domain}/${ref.repo}@${digest}`;
+  // Like containerd, the platform of the index entry decides. The config is
+  // checked only for a single-platform image: some old multi-arch images
+  // (containous/whoami) have a real 386 binary under a config that says amd64.
+  let checkArch = false;
   if (m.manifests) {
     const d = m.manifests.find((x) => x.platform?.os === PLATFORM.os && x.platform?.architecture === PLATFORM.architecture);
     if (!d) throw new PullError(`failed to pull and unpack image "${ref.name}": no match for platform in manifest: not found (the tab node runs linux/386 images, ${ref.name} has ${[...new Set(m.manifests.map((x) => x.platform && `${x.platform.os}/${x.platform.architecture}`).filter((x) => x && !x.startsWith("unknown")))].join(", ")})`);
     m = (await p.manifest(d.digest, MANIFEST_TYPES)).json;
   } else if (m.config) {
     // a single-platform image: it must be linux/386 itself
+    checkArch = true;
   } else {
     throw new PullError(`failed to pull and unpack image "${ref.name}": unsupported manifest`);
   }
-  const img = await unpackImage(p, ref, imageID, m, onFetching);
+  const img = await unpackImage(p, ref, imageID, m, onFetching, checkArch, progress);
   await p.remember(imageID, m);
   return img;
 }
@@ -213,7 +223,10 @@ const presentImage = (p, ref, imageID, m) => unpackImage(p, ref, imageID, m, nul
 
 // unpackImage fetches and unpacks what is missing of the image with the
 // manifest m. Without onFetching, it returns null if something is missing.
-async function unpackImage(p, ref, imageID, m, onFetching) {
+// With checkArch, the architecture of the config must be linux/386.
+// progress(layer, status, current, total) gets the steps of the layers
+// (the Pull* constants of dockerapi/images.go).
+async function unpackImage(p, ref, imageID, m, onFetching, checkArch = false, progress = null) {
   const size = m.layers.reduce((n, l) => n + (l.size || 0), 0) + (m.config.size || 0);
   await Promise.all(m.layers.map((l) => store.use(l.digest)));
   const indexes = await Promise.all(m.layers.map((l) => store.index(l.digest)));
@@ -223,17 +236,29 @@ async function unpackImage(p, ref, imageID, m, onFetching) {
     onFetching();
   }
   const config = JSON.parse(new TextDecoder().decode(await p.blob(m.config.digest)));
-  if (config.architecture && config.architecture !== PLATFORM.architecture) {
+  if (checkArch && config.architecture && config.architecture !== PLATFORM.architecture) {
     throw new PullError(`failed to pull and unpack image "${ref.name}": no match for platform in manifest: not found (the tab node runs linux/386 images, this one is ${config.os}/${config.architecture})`);
   }
   // Up to PULL_PARALLEL layers download and unpack at once, as containerd
   // does (max_concurrent_downloads = 3). It saves the round trips and the
   // time the mirror needs to fetch a blob from Docker Hub. The order of the
   // layers matters only for the root file system, not for the download.
+  const report = progress || (() => {});
   const add = async (l) => {
-    const { fetch, verify } = p.layer(l.digest);
+    // at most every 100 ms, the terminal redraws a line for each
+    let last = 0;
+    const { fetch, verify } = p.layer(l.digest, (n, end) => {
+      if (end) { report(l.digest, "verifying"); return; }
+      const now = Date.now();
+      if (now - last < 100) return;
+      last = now;
+      report(l.digest, "downloading", n, l.size || 0);
+    });
     try {
-      return await store.add(l.digest, fetch, verify, l.mediaType);
+      const idx = await store.add(l.digest, fetch, verify, l.mediaType);
+      report(l.digest, "downloaded");
+      report(l.digest, "complete");
+      return idx;
     } catch (e) {
       if (e instanceof PullError) throw e;
       const why = e?.name === "QuotaExceededError" ? "no space left on device" : e?.message || String(e);
@@ -241,6 +266,12 @@ async function unpackImage(p, ref, imageID, m, onFetching) {
     }
   };
   const missing = m.layers.map((l, i) => i).filter((i) => !indexes[i]);
+  if (!present) {
+    // what dockerd says first: the layers it has, then those it fetches
+    m.layers.forEach((l, i) => { if (indexes[i]) report(l.digest, "exists"); });
+    for (const i of missing) report(m.layers[i].digest, "fs");
+    missing.slice(PULL_PARALLEL).forEach((i) => report(m.layers[i].digest, "waiting"));
+  }
   let next = 0, failed = false;
   await Promise.all(Array.from({ length: Math.min(PULL_PARALLEL, missing.length) }, async () => {
     while (!failed && next < missing.length) {
@@ -254,7 +285,96 @@ async function unpackImage(p, ref, imageID, m, onFetching) {
     }
   }));
   const layers = m.layers.map((l, i) => ({ id: l.digest, entries: indexes[i].entries }));
-  return { present, size, imageID, config: config.config || {}, layers };
+  const info = describe(ref.name, imageID, m, config, indexes.map((x) => x.size || 0));
+  return { present, size, imageID, config: config.config || {}, layers, info };
+}
+
+// describe is an image as docker images and docker inspect show it (Image
+// in dockerapi/images.go). sizes are those of the unpacked layers.
+function describe(name, imageID, m, config, sizes) {
+  const c = config.config || {};
+  return {
+    name,
+    id: m.config.digest,
+    digest: imageID.slice(imageID.indexOf("@") + 1),
+    created: config.created || "0001-01-01T00:00:00Z",
+    size: sizes.reduce((a, b) => a + b, 0),
+    architecture: config.architecture || "",
+    os: config.os || "",
+    layers: m.layers.map((l) => l.digest),
+    diffIDs: config.rootfs?.diff_ids || [],
+    config: {
+      User: c.User || "", ExposedPorts: c.ExposedPorts || null, Env: c.Env || null, Entrypoint: c.Entrypoint || null,
+      Cmd: c.Cmd || null, WorkingDir: c.WorkingDir || "", Labels: c.Labels || null,
+    },
+  };
+}
+
+// refs lists what pulls left in the Cache Storage: the reference, the image
+// ID (repo@digest) and the manifest of its linux/386 variant.
+async function refs(c) {
+  const out = [];
+  for (const req of await c.keys()) {
+    const path = new URL(req.url).pathname;
+    if (!path.startsWith("/tabernetes-refs/")) continue;
+    const hit = await (await c.match(req))?.json().catch(() => null);
+    if (hit?.manifest?.layers && hit.manifest.config) out.push({ req, name: decodeURIComponent(path.slice(17)), ...hit });
+  }
+  return out;
+}
+
+// listImages lists the images of the tab, for docker images: the
+// references whose config and layers are all in the browser. The image
+// garbage collection may have taken layers of an image that no pod runs.
+async function listImages() {
+  store ??= await openStore();
+  const c = await caches.open(CACHE);
+  const out = [];
+  for (const r of await refs(c)) {
+    const sizes = await Promise.all(r.manifest.layers.map((l) => store.size(l.digest)));
+    if (sizes.some((s) => s == null)) continue;
+    const blob = await c.match(new URL(`/tabernetes-blobs/${r.manifest.config.digest}`, self.location.href).href);
+    if (!blob) continue;
+    const config = await blob.json().catch(() => null);
+    if (config) out.push(describe(r.name, r.imageID, r.manifest, config, sizes));
+  }
+  return out;
+}
+
+// removeImage forgets the reference name and deletes its config and the
+// layers that no other reference uses, for docker rmi. A layer that a pod
+// runs with stays (store.remove). It returns the digests it deleted.
+async function removeImage(name) {
+  store ??= await openStore();
+  const c = await caches.open(CACHE);
+  const all = await refs(c);
+  const me = all.find((r) => r.name === name);
+  if (!me) throw new Error(`No such image: ${name}`);
+  await c.delete(me.req);
+  const rest = all.filter((r) => r !== me);
+  const deleted = [];
+  if (!rest.some((r) => r.manifest.config.digest === me.manifest.config.digest)) {
+    await c.delete(new URL(`/tabernetes-blobs/${me.manifest.config.digest}`, self.location.href).href);
+    deleted.push(me.manifest.config.digest);
+  }
+  const used = new Set(rest.flatMap((r) => r.manifest.layers.map((l) => l.digest)));
+  for (const l of me.manifest.layers) {
+    if (!used.has(l.digest) && (await store.remove(l.digest))) deleted.push(l.digest);
+  }
+  return deleted;
+}
+
+// pullOnly pulls an image without a VM, for docker pull: dockerd always asks
+// the registry, so a present image is checked against its tag.
+async function pullOnly(m) {
+  const progress = (layer, status, current = 0, total = 0) => post({ type: "progress", layer, status, current, total });
+  try {
+    const img = await pullImage(m.registry, m.image, "Always", () => {}, progress);
+    if (!img.present) await store.gc().catch((e) => console.warn("tabernetes: image garbage collection:", e));
+    post({ type: "pulled", image: img.info, downloaded: !img.present });
+  } catch (e) {
+    post({ type: "error", message: e instanceof PullError ? e.message : `failed to pull and unpack image "${m.image}": ${e?.message || e}` });
+  }
 }
 
 // containerSpec merges the image config with the container of the pod, as
@@ -386,6 +506,10 @@ async function start(m) {
   // the VM boots while the image is pulled
   const vm = bootVM(m, memory);
   vm.catch(() => {});
+  // A prepared rootfs (the containerd snapshot, serialized by the shim as
+  // m.rootfs) boots without an image pull: startRootfs mirrors the file-system
+  // and boot half of this function, using m.container as the resolved process.
+  if (m.rootfs) return startRootfs(vm, m);
   let img;
   try {
     img = await pullImage(m.registry, m.image, m.pullPolicy, () => post({ type: "pulling" }));
@@ -394,7 +518,9 @@ async function start(m) {
     post({ type: "error", pull: true, never: e instanceof NeverPullError, message: e instanceof PullError ? e.message : `failed to pull and unpack image "${m.image}": ${e.message}` });
     return;
   }
-  post({ type: "pulled", present: img.present, size: img.size, imageID: img.imageID, ms: Date.now() - t0 });
+  // stopSignal: the STOPSIGNAL of the image, the default signal of docker
+  // stop and of a deleted pod (v86.go)
+  post({ type: "pulled", present: img.present, size: img.size, imageID: img.imageID, stopSignal: img.config.StopSignal || "", ms: Date.now() - t0 });
   // The layers of this pod are in use now; a new image may need room.
   if (!img.present) store.gc().catch((e) => console.warn("tabernetes: image garbage collection:", e));
 
@@ -424,6 +550,9 @@ async function start(m) {
     "etc/hosts": { mode: modes.S_IFREG | 0o644, data: enc.encode(`# Kubernetes-managed hosts file.\n127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n${m.ip ? `${m.ip}\t${m.hostname || ""}\n` : ""}`) },
   };
   if (m.gateway) extra["etc/resolv.conf"] = { mode: modes.S_IFREG | 0o644, data: enc.encode(`nameserver ${m.gateway}\n`) };
+  // The kubelet and Docker both write /etc/hostname; else it is the file of
+  // the image ("debuerreotype" in Debian images).
+  if (m.hostname) extra["etc/hostname"] = { mode: modes.S_IFREG | 0o644, data: enc.encode(`${m.hostname}\n`) };
   for (const [path, e] of Object.entries(extra)) {
     const key = `mem:${mem.size}`;
     mem.set(key, e.data);
@@ -474,6 +603,88 @@ async function start(m) {
   emulator.serial_send_bytes(1, new TextEncoder().encode(`go ${Date.now()} ${seed}\n`));
 }
 
+// startRootfs boots the VM with a prepared root file system: m.rootfs is the
+// serialized containerd snapshot ([{path, mode, data?, target?}], produced by
+// core/runtime/v2/v86/jsruntime/prepare.go). No image is pulled; m.container
+// carries the already-resolved process (args, env, workingDir, stdin, tty).
+async function startRootfs(vm, m) {
+  const c = m.container;
+  if (!c.args?.length) {
+    vm.then((v) => v.emulator.destroy(), () => {});
+    post({ type: "exit", code: 128, message: "no command specified" });
+    return;
+  }
+  const conf = { args: c.args, env: c.env || [], cwd: c.workingDir || "/", hostname: m.hostname, ip: m.ip, gateway: m.gateway, stdin: !!c.stdin, stdinOnce: !!c.stdinOnce, tty: !!c.tty };
+
+  const tree = new Tree();
+  const now = Math.floor(Date.now() / 1000);
+  const mem = new Map();
+  for (const f of m.rootfs) {
+    const type = f.mode & 0o170000;
+    if (type === modes.S_IFDIR) {
+      tree.set(f.path, { uid: 0, gid: 0, mtime: now, mode: f.mode });
+    } else if (type === modes.S_IFLNK) {
+      tree.set(f.path, { uid: 0, gid: 0, mtime: now, mode: f.mode, target: f.target });
+    } else {
+      const key = `mem:${mem.size}`;
+      mem.set(key, f.data);
+      tree.set(f.path, { uid: 0, gid: 0, mtime: now, mode: f.mode, size: f.data.length, key });
+    }
+  }
+
+  const enc = new TextEncoder();
+  const extra = {
+    ".tabernetes/config.json": { mode: modes.S_IFREG | 0o644, data: enc.encode(JSON.stringify(conf)) },
+    // what the kubelet mounts into every container (same as start).
+    "etc/hosts": { mode: modes.S_IFREG | 0o644, data: enc.encode(`# Kubernetes-managed hosts file.\n127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n${m.ip ? `${m.ip}\t${m.hostname || ""}\n` : ""}`) },
+  };
+  if (m.gateway) extra["etc/resolv.conf"] = { mode: modes.S_IFREG | 0o644, data: enc.encode(`nameserver ${m.gateway}\n`) };
+  // The kubelet and Docker both write /etc/hostname; else it is the file of
+  // the image ("debuerreotype" in Debian images).
+  if (m.hostname) extra["etc/hostname"] = { mode: modes.S_IFREG | 0o644, data: enc.encode(`${m.hostname}\n`) };
+  for (const [path, e] of Object.entries(extra)) {
+    const key = `mem:${mem.size}`;
+    mem.set(key, e.data);
+    tree.set(path, { uid: 0, gid: 0, mtime: now, mode: e.mode, size: e.data.length, key });
+  }
+  for (const d of ["dev", "proc", "sys", "tmp"]) {
+    if (!tree.files.has(d)) tree.set(d, { uid: 0, gid: 0, mtime: now, mode: modes.S_IFDIR | (d === "tmp" ? 0o1777 : 0o755) });
+  }
+  const fsJSON = tree.v86();
+
+  ({ emulator } = await vm);
+  // The console is stdout and stderr of the container (same as start).
+  const utf8 = new TextDecoder();
+  let out = [], timer = 0;
+  const flush = () => {
+    clearTimeout(timer);
+    timer = 0;
+    const data = utf8.decode(new Uint8Array(out), { stream: true });
+    out = [];
+    if (data) post({ type: "console", data });
+  };
+  emulator.add_listener("serial0-output-byte", (b) => {
+    out.push(b);
+    if (out.length >= 4096) flush();
+    else if (!timer) timer = setTimeout(flush, 20);
+  });
+  let error = "";
+  onControl = (l) => {
+    if (l === "started") post({ type: "started" });
+    else if (l.startsWith("error ")) error = l.slice(6);
+    else if (l.startsWith("exit ")) { flush(); post({ type: "exit", code: Number(l.slice(5)), message: error }); }
+  };
+  if (!emulator.is_running()) {
+    emulator.add_listener("serial1-output-byte", control);
+  }
+  emulator.fs9p.storage = new LayerStorage(new Map(), mem);
+  emulator.fs9p.load_from_json(fsJSON);
+  statRoot(emulator.fs9p, m.ephemeralStorage || (await imageFSCapacity()));
+  emulator.run();
+  const seed = [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, "0")).join("");
+  emulator.serial_send_bytes(1, new TextEncoder().encode(`go ${Date.now()} ${seed}\n`));
+}
+
 function connect(id, port) {
   const net = emulator?.network_adapter;
   if (!net?.connect) { post({ type: "conn", id, event: "close" }); return; }
@@ -489,6 +700,10 @@ function connect(id, port) {
 self.onmessage = ({ data: m }) => {
   switch (m.type) {
     case "start": start(m).catch((e) => post({ type: "error", message: String(e?.message || e) })); break;
+    // docker pull, docker images and docker rmi: no VM, the worker ends after the answer
+    case "pull": pullOnly(m); break;
+    case "images": listImages().then((images) => post({ type: "images", images }), (e) => post({ type: "error", message: String(e?.message || e) })); break;
+    case "rmi": removeImage(m.image).then((deleted) => post({ type: "removed", deleted }), (e) => post({ type: "error", message: String(e?.message || e) })); break;
     case "connect": connect(m.id, m.port); break;
     case "write": conns.get(m.id)?.write(new Uint8Array(m.data)); break;
     case "close": conns.get(m.id)?.close(); conns.delete(m.id); break;

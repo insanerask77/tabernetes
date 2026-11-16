@@ -38,6 +38,7 @@ func init() {
 		"head": head, "ls": ls, "mkdir": mkdir, "rm": rm, "seq": seq, "sleep": sleepCmd,
 		"sort": sortCmd, "tail": tail, "tee": tee, "touch": touch, "tr": tr,
 		"uname": uname, "uniq": uniq, "vi": viCmd, "vim": viCmd, "wc": wc, "wget": wget, "xargs": xargs,
+		"docker": dockerCmd,
 	}
 }
 

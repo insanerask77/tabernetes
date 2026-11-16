@@ -34,6 +34,7 @@ type v86VM struct {
 	ready   chan error // the container started, or did not
 	exited  chan int
 	isReady bool
+	stopSig string // the STOPSIGNAL of the image
 }
 
 // hasVM tells whether the tab can run container images (web/src/vm.js).
@@ -132,6 +133,11 @@ func (v *v86VM) start(ctx context.Context, log io.Writer, pull *imagePull) error
 		"pulling": fn(func([]js.Value) { pull.fetching() }),
 		"pulled": fn(func(a []js.Value) {
 			v.id = a[0].Get("imageID").String()
+			if s := a[0].Get("stopSignal"); s.Type() == js.TypeString {
+				v.mu.Lock()
+				v.stopSig = s.String()
+				v.mu.Unlock()
+			}
 			// The kubelet logs the pull and creates the container right
 			// after; here, the VM boots next.
 			pull.done(int64(a[0].Get("size").Float()))
@@ -193,12 +199,31 @@ func (v *v86VM) stop() {
 	})
 }
 
+// signal sends sig to the main process of the container (signalVM).
+func (v *v86VM) signal(ctx context.Context, sig int) error {
+	return signalVM(ctx, v.dial, sig)
+}
+
+// stopSignal is the STOPSIGNAL of the image, or "".
+func (v *v86VM) stopSignal() string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.stopSig
+}
+
 // dial opens a TCP connection to port of the pod, through the network card
 // of the VM.
 func (v *v86VM) dial(port int32) (net.Conn, error) {
 	if v.h.Type() != js.TypeObject {
 		return nil, errors.New("the container is not running")
 	}
+	return dialVM(v.h, v.tp.ip, port)
+}
+
+// dialVM opens a TCP connection to port of a VM, through its network card:
+// vm is the handle of vm.js start(), ip is for the error messages. Docker
+// containers use it too (docker.go).
+func dialVM(vm js.Value, ip string, port int32) (net.Conn, error) {
 	local, remote := net.Pipe()
 	in := make(chan []byte, 1024)
 	connected := make(chan bool, 1)
@@ -247,7 +272,7 @@ func (v *v86VM) dial(port int32) (net.Conn, error) {
 		}
 		end()
 	})
-	h := v.h.Call("connect", int(port), onConnect, onData, onClose)
+	h := vm.Call("connect", int(port), onConnect, onData, onClose)
 	release := func() {
 		time.AfterFunc(time.Minute, func() {
 			for _, f := range funcs {
@@ -260,12 +285,12 @@ func (v *v86VM) dial(port int32) (net.Conn, error) {
 		if !ok {
 			h.Call("close")
 			release()
-			return nil, fmt.Errorf("dial tcp %s:%d: connect: connection refused", v.tp.ip, port)
+			return nil, fmt.Errorf("dial tcp %s:%d: connect: connection refused", ip, port)
 		}
 	case <-time.After(10 * time.Second):
 		h.Call("close")
 		release()
-		return nil, fmt.Errorf("dial tcp %s:%d: i/o timeout", v.tp.ip, port)
+		return nil, fmt.Errorf("dial tcp %s:%d: i/o timeout", ip, port)
 	}
 	// pod -> caller
 	go func() {
